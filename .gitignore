@@ -12,3 +12,6 @@ __pycache__/
 cache/
 logs/
 .DS_Store
+
+# direnv (Kacific PAT via Keychain; never committed)
+.envrc
