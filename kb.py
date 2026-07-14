@@ -35,7 +35,15 @@ VALID_TYPES = {"how-to", "troubleshooting", "faq", "known-issue", "reference", "
 VALID_STATUS = {"draft", "published", "needs-update", "archived", "retired"}
 ROT_OUTDATED_DAYS = 30
 READER_STALE_DAYS = 90
+TRIVIAL_BODY_CHARS = 40  # only near-empty stubs; a normal short nugget is legitimate, not trivial
 MISS_RESPONSE = "I cannot find this information in the current knowledge base."
+
+# A small stop list so query matching keys off meaningful terms, not filler. Deliberately tiny and stdlib.
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "is", "are", "was", "were", "be", "with",
+    "how", "what", "when", "where", "which", "who", "do", "does", "did", "can", "i", "we", "you", "it",
+    "this", "that", "at", "by", "from", "as", "my", "our",
+}
 
 
 # --- config -----------------------------------------------------------------
@@ -90,6 +98,14 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
     return meta, body
 
 
+def _as_list(value) -> list:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
 def _iso_date(value) -> datetime | None:
     if not value or value == "unverified":
         return None
@@ -139,6 +155,83 @@ def body_hash(body: str) -> str:
     return hashlib.sha256(body.strip().encode("utf-8")).hexdigest()
 
 
+# --- nugget loading (shared by index, answer, rot) --------------------------
+
+def _load_nuggets(root: Path) -> list[dict]:
+    """Walk a KB repo and return every nugget as {meta, body, path}. Index from content, never filename.
+
+    A file is a nugget only if its frontmatter carries an id. README/registry mirrors, the house docs, and
+    the sources/ binary store are skipped, so they never masquerade as nuggets.
+    """
+    nuggets: list[dict] = []
+    for md in sorted(root.rglob("*.md")):
+        if md.name in {"README.md", "registry.md", "AGENTS.md", "CLAUDE.md"} or "sources" in md.parts:
+            continue
+        meta, body = parse_frontmatter(md.read_text(encoding="utf-8"))
+        if not meta.get("id"):
+            continue
+        nuggets.append({"meta": meta, "body": body, "path": md.relative_to(root)})
+    return nuggets
+
+
+def _registry_entry(n: dict) -> dict:
+    m = n["meta"]
+    return {
+        "id": m["id"],
+        "title": m.get("title", ""),
+        "domain": m.get("domain"),
+        "type": m.get("type"),
+        "status": m.get("status"),
+        "owner_gid": m.get("owner_gid"),
+        "owner_name": m.get("owner_name"),
+        "source_document": m.get("source"),
+        "confidence_score": m.get("confidence"),
+        "last_verified": m.get("verified"),
+        "path": str(n["path"]),
+        "content_hash": body_hash(n["body"]),
+    }
+
+
+# --- retrieval (grounding-only, keyword match over stored nuggets) ----------
+
+def _tokens(text: str) -> list[str]:
+    return [t for t in re.findall(r"[a-z0-9]+", str(text).lower()) if len(t) > 1 and t not in _STOPWORDS]
+
+
+def _nugget_terms(n: dict) -> dict:
+    """Weighted term frequencies for a nugget: title counts most, then tags, then body."""
+    m = n["meta"]
+    terms: dict = {}
+    weighted = ((3, m.get("title", "")), (2, " ".join(_as_list(m.get("tags")))), (1, n["body"]))
+    for weight, field in weighted:
+        for t in _tokens(field):
+            terms[t] = terms.get(t, 0) + weight
+    return terms
+
+
+def _score(query_terms: list[str], n: dict) -> int:
+    terms = _nugget_terms(n)
+    return sum(terms.get(qt, 0) for qt in query_terms)
+
+
+def _rank(query: str, nuggets: list[dict]) -> list[tuple[int, dict]]:
+    q = _tokens(query)
+    scored = [(_score(q, n), n) for n in nuggets]
+    scored = [(s, n) for s, n in scored if s > 0]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return scored
+
+
+# --- interaction log (usage / ratings / misses; never a KB nugget) ----------
+
+def _log_interaction(record: dict, log_path: str = "logs/interactions.jsonl") -> None:
+    record = {"ts": _now_iso(), **record}
+    p = Path(log_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+
 # --- subcommands ------------------------------------------------------------
 
 def cmd_store(args) -> int:
@@ -150,50 +243,166 @@ def cmd_store(args) -> int:
         for e in errors:
             print(f"  - {e}", file=sys.stderr)
         return 1
-    print(f"OK: nugget '{meta['id']}' passes the schema and the anti-hallucination gate.")
-    # TODO(1a): write into the correct audience repo by domain/audience, then trigger index.
+    if args.into:
+        dest_dir = Path(args.into) / (meta.get("domain") or "shared")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / f"{meta['id']}.md"
+        dest.write_text(text, encoding="utf-8")
+        print(f"OK: stored nugget '{meta['id']}' at {dest} (passes schema + anti-hallucination gate).")
+        print("Next: run `kb.py index` on the repo to refresh the registry.")
+    else:
+        print(f"OK: nugget '{meta['id']}' passes the schema and the anti-hallucination gate.")
+        print("Validate-only (no --into given). Pass --into <repo> to write it into the KB.")
     return 0
 
 
 def cmd_index(args) -> int:
     root = Path(args.repo)
-    entries = []
-    for md in sorted(root.rglob("*.md")):
-        if md.name in {"README.md", "registry.md"} or "sources" in md.parts:
-            continue
-        meta, body = parse_frontmatter(md.read_text(encoding="utf-8"))
-        if not meta.get("id"):
-            continue  # not a nugget (index from content, never from filename)
-        entries.append({
-            "id": meta["id"],
-            "title": meta.get("title", ""),
-            "domain": meta.get("domain"),
-            "type": meta.get("type"),
-            "status": meta.get("status"),
-            "owner_gid": meta.get("owner_gid"),
-            "source_document": meta.get("source"),
-            "confidence_score": meta.get("confidence"),
-            "last_verified": meta.get("verified"),
-            "path": str(md.relative_to(root)),
-            "content_hash": body_hash(body),
-        })
+    entries = [_registry_entry(n) for n in _load_nuggets(root)]
     out = {"schema_version": SCHEMA_VERSION, "generated_utc": _now_iso(), "entries": entries}
-    print(json.dumps(out, indent=2))
-    # TODO(1a): write registry-aggregate.json privately, then derive audience slices per repo.
+    payload = json.dumps(out, indent=2)
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out).write_text(payload + "\n", encoding="utf-8")
+        print(f"OK: wrote {len(entries)} entries to {args.out}")
+    else:
+        print(payload)
+    # Audience-scoped slicing across the three data repos is Phase 1b; this emits the single-repo aggregate.
     return 0
 
 
 def cmd_answer(args) -> int:
-    # TODO(1a): retrieve matching nuggets, apply the answer contract (grounding, citation, confidence,
-    # conflict surfacing, 90-day footnote). On no match, emit MISS_RESPONSE and log the gap.
-    print(MISS_RESPONSE)
+    root = Path(args.repo)
+    nuggets = _load_nuggets(root)
+    ranked = _rank(args.query, nuggets)
+
+    if not ranked:
+        if not args.no_log:
+            _log_interaction({"query": args.query, "hit": False, "kind": "gap"})
+        if args.format == "json":
+            print(json.dumps({"query": args.query, "found": False, "answer": MISS_RESPONSE}, indent=2))
+        else:
+            print(MISS_RESPONSE)
+        return 0
+
+    top_score = ranked[0][0]
+    winners = [n for s, n in ranked if s == top_score]
+    conflict = len(winners) > 1
+    now = datetime.now(timezone.utc)
+
+    if not args.no_log:
+        _log_interaction({
+            "query": args.query, "hit": True,
+            "cited": [n["meta"]["id"] for n in winners], "conflict": conflict,
+        })
+
+    def _notes(n: dict) -> list[str]:
+        notes = []
+        m = n["meta"]
+        verified = _iso_date(m.get("verified"))
+        if verified is None or (now - verified).days > READER_STALE_DAYS:
+            notes.append("Note: this document has not been audited recently.")
+        if m.get("status") and m["status"] != "published":
+            notes.append(f"Note: this nugget's status is '{m['status']}', not published.")
+        return notes
+
+    def _cite(n: dict) -> str:
+        m = n["meta"]
+        return m.get("source") or (f"attested by {m.get('attested_by')}" if m.get("attested_by") else m["id"])
+
+    if args.format == "json":
+        payload = {
+            "query": args.query,
+            "found": True,
+            "conflict": conflict,
+            "nuggets": [{
+                "id": n["meta"]["id"],
+                "title": n["meta"].get("title", ""),
+                "answer": n["body"].strip(),
+                "source_document": _cite(n),
+                "confidence_score": n["meta"].get("confidence"),
+                "last_updated": n["meta"].get("verified"),
+                "status": n["meta"].get("status"),
+                "notes": _notes(n),
+            } for n in winners],
+        }
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    # Human format: lead with the answer, cite every nugget, surface conflicts, list sources at the end.
+    if conflict:
+        print("Conflicting nuggets match this query; a human editor should resolve which is authoritative.\n")
+    for n in winners:
+        m = n["meta"]
+        print(n["body"].strip())
+        print(f"\n[Source: {m['id']} | {_cite(n)}]")
+        for note in _notes(n):
+            print(note)
+        print()
+    print("Sources Verified:")
+    for n in winners:
+        m = n["meta"]
+        print(f"  - {m['id']}: {m.get('title', '')} (verified {m.get('verified', 'unverified')})")
     return 0
 
 
 def cmd_rot(args) -> int:
-    # TODO(1a): walk the registry, flag Outdated (verified > 30d), Redundant (dup/superseded), Trivial;
-    # emit a report keyed to each owner. 1b raises the Asana tasks.
-    print("rot: not yet implemented", file=sys.stderr)
+    root = Path(args.repo)
+    nuggets = _load_nuggets(root)
+    now = datetime.now(timezone.utc)
+
+    by_id: dict = {}
+    by_source: dict = {}
+    superseded: set = set()
+    for n in nuggets:
+        m = n["meta"]
+        by_id.setdefault(m["id"], []).append(n)
+        if m.get("source"):
+            by_source.setdefault(m["source"], []).append(n)
+        for s in _as_list(m.get("supersedes")):
+            superseded.add(s)
+
+    flags: list[dict] = []
+    for n in nuggets:
+        m = n["meta"]
+        reasons = []
+        verified = _iso_date(m.get("verified"))
+        if verified is None:
+            reasons.append("Outdated (never verified)")
+        elif (now - verified).days > ROT_OUTDATED_DAYS:
+            reasons.append(f"Outdated (verified {(now - verified).days} days ago)")
+        if len(by_id[m["id"]]) > 1:
+            reasons.append("Redundant (duplicate id)")
+        if m.get("source") and len(by_source[m["source"]]) > 1:
+            reasons.append("Redundant (shares source with another nugget)")
+        if m["id"] in superseded:
+            reasons.append("Redundant (superseded by another nugget)")
+        if m.get("status") in {"archived", "retired"}:
+            reasons.append(f"Redundant (status {m['status']})")
+        if len(n["body"].strip()) < TRIVIAL_BODY_CHARS:
+            reasons.append("Trivial (near-empty body; owner confirms)")
+        if reasons:
+            flags.append({
+                "id": m["id"], "path": str(n["path"]),
+                "owner": m.get("owner_name") or m.get("owner_gid") or "(unassigned)",
+                "reasons": reasons,
+            })
+
+    if not flags:
+        print(f"rot: clean. {len(nuggets)} nuggets, none flagged.")
+        return 0
+
+    by_owner: dict = {}
+    for f in flags:
+        by_owner.setdefault(f["owner"], []).append(f)
+
+    print(f"rot: {len(flags)} of {len(nuggets)} nuggets flagged, grouped by owner.\n")
+    for owner in sorted(by_owner):
+        print(f"owner: {owner}")
+        for f in sorted(by_owner[owner], key=lambda x: x["id"]):
+            print(f"  - {f['id']} ({f['path']}): {'; '.join(f['reasons'])}")
+        print()
+    # Phase 1b raises these as Asana tasks per the audit-family contract; 1a only reports.
     return 0
 
 
@@ -214,17 +423,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("store", help="validate and store a nugget")
     sp.add_argument("file")
+    sp.add_argument("--into", help="KB repo root to write the nugget into (by domain); omit to validate only")
     sp.set_defaults(func=cmd_store)
 
     sp = sub.add_parser("index", help="rebuild the registry from a repo")
     sp.add_argument("repo")
+    sp.add_argument("--out", help="write the aggregate registry JSON here; omit to print to stdout")
     sp.set_defaults(func=cmd_index)
 
     sp = sub.add_parser("answer", help="answer a query from stored nuggets")
     sp.add_argument("query")
+    sp.add_argument("--repo", default=".", help="KB repo root to search (default: current dir)")
+    sp.add_argument("--format", choices=["human", "json"], default="human")
+    sp.add_argument("--no-log", action="store_true", help="do not append to the interaction log")
     sp.set_defaults(func=cmd_answer)
 
     sp = sub.add_parser("rot", help="hygiene sweep")
+    sp.add_argument("--repo", default=".", help="KB repo root to sweep (default: current dir)")
     sp.set_defaults(func=cmd_rot)
 
     for name in ("sync", "prescan", "export", "feedback"):
