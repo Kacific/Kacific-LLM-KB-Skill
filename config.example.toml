@@ -1,0 +1,20 @@
+# Copy to config.toml (gitignored) and fill in for your deployment.
+# Store credential LOCATIONS only, never the secret values.
+
+[tracking]
+# The task-tracking workspace and portfolio (real GIDs live in the private control home, not here).
+workspace_gid = "<workspace-gid>"
+portfolio_gid = "<portfolio-gid>"
+project_gid = "<ai-tracking-project-gid>"
+
+[tracking.pat]
+# Location of the tracking PAT, resolved at runtime. Never the value.
+# Dev (macOS): a Keychain entry name, read with: security find-generic-password -s <entry> -w
+macos_keychain_entry = "<entry-name>"
+# Prod (NUC/Linux): a root-owned secret file path.
+secret_file = "/root/.secrets/<file>"
+expires_at = "<YYYY-MM-DD>"   # tracked; warn 7 days before expiry
+
+[repos]
+# The private control home holds the authoritative repos.toml manifest. This template only points at it.
+manifest = "<path-to-private-repos.toml>"

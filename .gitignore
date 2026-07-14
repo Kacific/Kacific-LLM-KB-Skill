@@ -1,0 +1,14 @@
+# Secrets and deployment specifics (never in the public repo)
+config.toml
+
+# Claude Code local session settings (never in a public repo)
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Local caches and logs (the private control home owns the durable logs)
+cache/
+logs/
+.DS_Store
