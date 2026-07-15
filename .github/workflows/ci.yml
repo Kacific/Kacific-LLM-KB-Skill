@@ -12,5 +12,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Run kb.py acceptance harness
+      - name: Run kb.py core acceptance harness
         run: python3 tests/run_acceptance.py
+      - name: Run kb.py git/manifest acceptance harness
+        run: python3 tests/run_git_acceptance.py
