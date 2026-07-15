@@ -18,3 +18,6 @@ expires_at = "<YYYY-MM-DD>"   # tracked; warn 7 days before expiry
 [repos]
 # The private control home holds the authoritative repos.toml manifest. This template only points at it.
 manifest = "<path-to-private-repos.toml>"
+# Clone cache for manifest-driven `index --manifest` and `sync`: the tool clones and fetches each managed
+# repo here. Optional; defaults to <manifest dir>/cache/repos (gitignored in the control home).
+workspace = "<path-to-clone-cache>"

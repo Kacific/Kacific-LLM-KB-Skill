@@ -22,6 +22,7 @@ import argparse
 import hashlib
 import json
 import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,12 +47,9 @@ _STOPWORDS = {
 }
 
 
-# --- config -----------------------------------------------------------------
+# --- config + manifest ------------------------------------------------------
 
-def load_config(path: str = "config.toml") -> dict:
-    p = Path(path)
-    if not p.exists():
-        return {}
+def _load_toml(path: Path) -> dict:
     try:
         import tomllib  # Python 3.11+
     except ModuleNotFoundError:  # pragma: no cover
@@ -59,11 +57,42 @@ def load_config(path: str = "config.toml") -> dict:
             import tomli as tomllib
         except ModuleNotFoundError:
             raise SystemExit(
-                "config.toml needs Python 3.11+ (stdlib tomllib) or the tomli backport; "
+                "reading TOML needs Python 3.11+ (stdlib tomllib) or the tomli backport; "
                 "run kb.py with a newer interpreter, e.g. /opt/homebrew/bin/python3"
             )
-    with p.open("rb") as fh:
+    with path.open("rb") as fh:
         return tomllib.load(fh)
+
+
+def load_config(path: str = "config.toml") -> dict:
+    p = Path(path).expanduser()
+    if not p.exists():
+        return {}
+    return _load_toml(p)
+
+
+def load_manifest(config: dict) -> dict:
+    """Resolve the managed-repo manifest named by config [repos].manifest.
+
+    Returns {managed, audiences, cache_dir, manifest_path}. The clone cache defaults to
+    <manifest dir>/cache/repos (gitignored in the control home) unless [repos].workspace overrides it.
+    """
+    repos_cfg = config.get("repos", {})
+    manifest_path = repos_cfg.get("manifest")
+    if not manifest_path:
+        raise SystemExit("config is missing [repos].manifest (the path to repos.toml)")
+    mp = Path(manifest_path).expanduser()
+    if not mp.exists():
+        raise SystemExit(f"manifest not found at [repos].manifest: {mp}")
+    manifest = _load_toml(mp)
+    workspace = repos_cfg.get("workspace")
+    cache_dir = Path(workspace).expanduser() if workspace else mp.parent / "cache" / "repos"
+    return {
+        "managed": manifest.get("managed", {}),
+        "audiences": manifest.get("audiences", {}),
+        "cache_dir": cache_dir,
+        "manifest_path": mp,
+    }
 
 
 # --- frontmatter ------------------------------------------------------------
@@ -155,6 +184,47 @@ def body_hash(body: str) -> str:
     return hashlib.sha256(body.strip().encode("utf-8")).hexdigest()
 
 
+# --- git + clone cache (manifest-driven index/sync) -------------------------
+
+def _git(args: list[str], cwd=None, timeout: int = 180) -> subprocess.CompletedProcess:
+    """Run git without ever raising the argv (which can carry a remote URL); callers check returncode.
+
+    stdin is closed so a credential prompt fails fast rather than hanging a cron run, and the exception is
+    scrubbed to a synthetic failed result so a host or token can never surface in a traceback.
+    """
+    try:
+        return subprocess.run(
+            ["git", *args], cwd=cwd, check=False, capture_output=True, text=True,
+            stdin=subprocess.DEVNULL, timeout=timeout,
+        )
+    except FileNotFoundError:
+        raise SystemExit("git not found on PATH")
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(["git", args[0] if args else "git"], 124, "", "timed out")
+
+
+def _refresh_clone(url: str, dest: Path) -> tuple[str | None, str]:
+    """Clone-if-absent, fetch, and hard-reset the tool-owned cache to the remote default branch.
+
+    Returns (head_sha, status). A non-'ok' status means the repo was unreachable; the caller records it and
+    carries on with the other repos rather than aborting the whole run (source-health over fail-fast).
+    """
+    dest = Path(dest)
+    if not (dest / ".git").exists():
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if _git(["clone", "--quiet", url, str(dest)]).returncode != 0:
+            return None, "unreachable (clone failed)"
+    if _git(["fetch", "--prune", "--quiet", "origin"], cwd=str(dest)).returncode != 0:
+        return None, "unreachable (fetch failed)"
+    _git(["remote", "set-head", "origin", "-a"], cwd=str(dest))  # point origin/HEAD at the remote default
+    if _git(["reset", "--hard", "--quiet", "origin/HEAD"], cwd=str(dest)).returncode != 0:
+        return None, "checkout failed"
+    head = _git(["rev-parse", "HEAD"], cwd=str(dest))
+    if head.returncode != 0:
+        return None, "rev-parse failed"
+    return head.stdout.strip(), "ok"
+
+
 # --- nugget loading (shared by index, answer, rot) --------------------------
 
 def _load_nuggets(root: Path) -> list[dict]:
@@ -189,6 +259,34 @@ def _registry_entry(n: dict) -> dict:
         "last_verified": m.get("verified"),
         "path": str(n["path"]),
         "content_hash": body_hash(n["body"]),
+    }
+
+
+def build_aggregate(manifest: dict) -> dict:
+    """Walk every managed repo's refreshed clone and build the full cross-audience aggregate registry.
+
+    Records each repo's resolved HEAD sha (the drift baseline sync diffs against) and tags every entry with
+    its source_repo. Audience-scoped slicing (deriving each repo's published slice from this aggregate) is a
+    separate later chunk; this is the private full index only.
+    """
+    cache_dir = manifest["cache_dir"]
+    repos_out: dict = {}
+    entries: list = []
+    for key, spec in sorted(manifest["managed"].items()):
+        url, audience = spec.get("url"), spec.get("audience")
+        head, status = _refresh_clone(url, cache_dir / key)
+        repos_out[key] = {"url": url, "audience": audience, "head_sha": head, "status": status}
+        if status != "ok":
+            continue
+        for n in _load_nuggets(cache_dir / key):
+            entry = _registry_entry(n)
+            entry["source_repo"] = key
+            entries.append(entry)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_utc": _now_iso(),
+        "repos": repos_out,
+        "entries": entries,
     }
 
 
@@ -257,6 +355,26 @@ def cmd_store(args) -> int:
 
 
 def cmd_index(args) -> int:
+    if getattr(args, "manifest", False):
+        manifest = load_manifest(load_config(args.config))
+        agg = build_aggregate(manifest)
+        out_path = (
+            Path(args.out).expanduser() if args.out
+            else manifest["manifest_path"].parent / "registry-aggregate.json"
+        )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(agg, indent=2) + "\n", encoding="utf-8")
+        ok = [k for k, r in agg["repos"].items() if r["status"] == "ok"]
+        print(f"OK: aggregate written to {out_path} "
+              f"({len(agg['entries'])} entries across {len(ok)}/{len(agg['repos'])} managed repos).")
+        for key, r in sorted(agg["repos"].items()):
+            if r["status"] != "ok":
+                print(f"  WARN: repo '{key}': {r['status']}", file=sys.stderr)
+        return 0
+
+    if not args.repo:
+        print("index: give a repo path, or --manifest to build the cross-repo aggregate.", file=sys.stderr)
+        return 2
     root = Path(args.repo)
     entries = [_registry_entry(n) for n in _load_nuggets(root)]
     out = {"schema_version": SCHEMA_VERSION, "generated_utc": _now_iso(), "entries": entries}
@@ -267,7 +385,6 @@ def cmd_index(args) -> int:
         print(f"OK: wrote {len(entries)} entries to {args.out}")
     else:
         print(payload)
-    # Audience-scoped slicing across the three data repos is Phase 1b; this emits the single-repo aggregate.
     return 0
 
 
@@ -426,9 +543,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--into", help="KB repo root to write the nugget into (by domain); omit to validate only")
     sp.set_defaults(func=cmd_store)
 
-    sp = sub.add_parser("index", help="rebuild the registry from a repo")
-    sp.add_argument("repo")
-    sp.add_argument("--out", help="write the aggregate registry JSON here; omit to print to stdout")
+    sp = sub.add_parser("index", help="rebuild the registry from a repo, or --manifest for the aggregate")
+    sp.add_argument("repo", nargs="?", help="single KB repo root to index; omit when using --manifest")
+    sp.add_argument("--manifest", action="store_true",
+                    help="build the cross-repo aggregate from config [repos].manifest into the control home")
+    sp.add_argument("--config", default="config.toml", help="path to config.toml (used with --manifest)")
+    sp.add_argument("--out",
+                    help="output path; default stdout (single repo) or <manifest dir>/registry-aggregate.json")
     sp.set_defaults(func=cmd_index)
 
     sp = sub.add_parser("answer", help="answer a query from stored nuggets")
