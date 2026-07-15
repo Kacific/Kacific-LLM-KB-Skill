@@ -76,20 +76,26 @@ def make_remote(root: Path, key: str, files: dict[str, str]) -> str:
     return f"file://{bare}"
 
 
-def write_manifest(admin: Path, cache: Path, remotes: dict[str, tuple[str, str]]) -> Path:
-    """Write repos.toml + config.toml under admin/; return the config path."""
+def write_manifest(admin: Path, cache: Path, remotes: dict[str, tuple[str, str]],
+                   cache_ttl: int | None = None) -> Path:
+    """Write repos.toml + config.toml under admin/; return the config path.
+
+    cache_ttl, when given, adds a [cache] fetch_ttl_seconds line so the git-fetch reuse cache is exercised.
+    """
     lines = []
     for key, (url, audience) in remotes.items():
         lines += [f"[managed.{key}]", f'url = "{url}"', f'audience = "{audience}"', ""]
     lines += ["[audiences]", 'AllStaff = ["AllStaff"]', 'IT = ["AllStaff", "IT"]', ""]
     (admin / "repos.toml").write_text("\n".join(lines), encoding="utf-8")
     cfg = admin / "config.toml"
-    cfg.write_text(
+    cfg_text = (
         "[repos]\n"
         f'manifest = "{admin / "repos.toml"}"\n'
-        f'workspace = "{cache}"\n',
-        encoding="utf-8",
+        f'workspace = "{cache}"\n'
     )
+    if cache_ttl is not None:
+        cfg_text += f"\n[cache]\nfetch_ttl_seconds = {cache_ttl}\n"
+    cfg.write_text(cfg_text, encoding="utf-8")
     return cfg
 
 
@@ -259,6 +265,105 @@ def sync_flags_out_of_band_invalid_and_unmanaged():
             and "unmanaged" in out and "rogue" in out
         )
         return ok, f"stdout={out.strip()[:160]!r}"
+
+
+@check
+def cache_ttl_skips_fetch_within_window_and_force_refetches():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        admin = root / "admin"; admin.mkdir()
+        cache = root / "cache"
+        url_a = make_remote(root, "allstaff", {
+            "shared/wifi.md": nugget("shared-wifi", "shared", "Wifi", "Join the staff SSID to get online."),
+        })
+        cfg = write_manifest(admin, cache, {"allstaff": (url_a, "AllStaff")})
+        agg_path = admin / "registry-aggregate.json"
+
+        # Baseline: fetch S0 and stamp the cache.
+        if kb("index", "--manifest", "--config", str(cfg)).returncode != 0:
+            return False, "baseline index failed"
+        s0 = json.loads(agg_path.read_text())["repos"]["allstaff"]["head_sha"]
+
+        # Remote moves on (S1): a new nugget appears upstream.
+        commit_to_remote(root, "allstaff", writes={
+            "shared/guide.md": nugget("shared-guide", "shared", "Guide", "A brand new starter guide entry."),
+        })
+
+        # Within the window: the fetch is skipped, so the aggregate still shows S0 and misses the new nugget.
+        kb("index", "--manifest", "--config", str(cfg), "--max-age", "3600")
+        agg_cached = json.loads(agg_path.read_text())
+        s_cached = agg_cached["repos"]["allstaff"]["head_sha"]
+        ids_cached = {e["id"] for e in agg_cached["entries"]}
+
+        # --force ignores the cache: S1 and the new nugget appear.
+        kb("index", "--manifest", "--config", str(cfg), "--force")
+        agg_forced = json.loads(agg_path.read_text())
+        s1 = agg_forced["repos"]["allstaff"]["head_sha"]
+        ids_forced = {e["id"] for e in agg_forced["entries"]}
+
+        # Remote moves again (S2); --max-age 0 must fetch (a reuse would still report S1).
+        commit_to_remote(root, "allstaff", writes={
+            "shared/faq.md": nugget("shared-faq", "shared", "FAQ", "Another fresh entry for the zero test."),
+        })
+        kb("index", "--manifest", "--config", str(cfg), "--max-age", "0")
+        s2 = json.loads(agg_path.read_text())["repos"]["allstaff"]["head_sha"]
+
+        ok = (
+            bool(s0) and s_cached == s0 and "shared-guide" not in ids_cached
+            and s1 != s0 and "shared-guide" in ids_forced
+            and s2 != s1
+        )
+        detail = (f"s0={s0[:7] if s0 else s0} cached={s_cached[:7]} "
+                  f"s1={s1[:7]} s2={s2[:7]} guide_cached={'shared-guide' in ids_cached}")
+        return ok, detail
+
+
+@check
+def sync_always_fetches_ignoring_ttl():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        admin = root / "admin"; admin.mkdir()
+        cache = root / "cache"
+        url_a = make_remote(root, "allstaff", {
+            "shared/ok.md": nugget("shared-ok", "shared", "OK", "A properly grounded and sourced fact."),
+        })
+        # A huge TTL that would suppress an index fetch must NOT suppress sync's drift check.
+        cfg = write_manifest(admin, cache, {"allstaff": (url_a, "AllStaff")}, cache_ttl=99999)
+        if kb("index", "--manifest", "--config", str(cfg)).returncode != 0:
+            return False, "baseline index failed"
+        commit_to_remote(root, "allstaff", writes={
+            "shared/new.md": nugget("shared-new", "shared", "New", "A change sync must catch despite the TTL."),
+        })
+        p = kb("sync", "--config", str(cfg))
+        out = p.stdout
+        ok = (
+            p.returncode == 0 and "clean" not in out
+            and "repo: allstaff" in out and "added: shared-new" in out
+        )
+        return ok, f"stdout={out.strip()[:160]!r}"
+
+
+@check
+def cache_subcommand_reports_and_clears():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        admin = root / "admin"; admin.mkdir()
+        cache = root / "cache"
+        url_a = make_remote(root, "allstaff", {
+            "shared/ok.md": nugget("shared-ok", "shared", "OK", "A properly grounded and sourced fact."),
+        })
+        cfg = write_manifest(admin, cache, {"allstaff": (url_a, "AllStaff")})
+        if kb("index", "--manifest", "--config", str(cfg)).returncode != 0:
+            return False, "index failed"
+        rep = kb("cache", "--config", str(cfg))
+        clr = kb("cache", "--config", str(cfg), "--clear")
+        empt = kb("cache", "--config", str(cfg))
+        ok = (
+            rep.returncode == 0 and "git_fetch" in rep.stdout
+            and clr.returncode == 0 and "cleared" in clr.stdout
+            and empt.returncode == 0 and "empty" in empt.stdout
+        )
+        return ok, f"report_has_git_fetch={'git_fetch' in rep.stdout} cleared={'cleared' in clr.stdout} empty={'empty' in empt.stdout}"
 
 
 def main() -> int:

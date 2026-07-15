@@ -196,6 +196,35 @@ def sync_requires_manifest():
     return ok, f"rc={p.returncode} stderr={p.stderr.strip()!r}"
 
 
+@check
+def cache_primitive_ttl():
+    # Exercise the lookup-cache primitive directly (no git, no network): a fresh set hits within a live TTL,
+    # a zero TTL always misses, a stamp far in the past misses, and a corrupt store is a miss not a crash.
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        kb._cache_set(root, "ns", "k", {"v": 1})
+        hit_fresh, val = kb._cache_get(root, "ns", "k", 3600)
+        miss_zero, _ = kb._cache_get(root, "ns", "k", 0)
+
+        # Hand-write a 2020 stamp so the age exceeds any finite TTL, deterministically (no sleep).
+        store_path = kb._cache_file(root, "ns")
+        store_path.write_text(
+            json.dumps({"k": {"value": {"v": 1}, "stored_utc": "2020-01-01T00:00:00Z"}}), encoding="utf-8"
+        )
+        hit_stale, _ = kb._cache_get(root, "ns", "k", 3600)
+
+        # A corrupt store must degrade to a miss, never raise.
+        store_path.write_text("{not json", encoding="utf-8")
+        try:
+            hit_corrupt, _ = kb._cache_get(root, "ns", "k", 3600)
+            crashed = False
+        except Exception:
+            hit_corrupt, crashed = True, True
+
+    ok = hit_fresh and val == {"v": 1} and (not miss_zero) and (not hit_stale) and (not hit_corrupt) and not crashed
+    return ok, f"fresh={hit_fresh} zero_miss={not miss_zero} stale_miss={not hit_stale} corrupt_miss={not hit_corrupt}"
+
+
 def main() -> int:
     failures = 0
     for fn in CHECKS:

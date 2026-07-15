@@ -13,6 +13,7 @@ Subcommands:
   prescan   one-time extraction of existing repos and KBs to seed the registry (secrets-safe)
   export    render a neutral bundle (Markdown/HTML) for an export target (1b)
   feedback  append a usage/rating/miss record; optionally raise a tracking task (1b)
+  cache     inspect or clear the local, gitignored TTL lookup cache (git-fetch reuse; Asana lookups later)
 
 Run one-off by hand, or schedule sync/rot/index on the NUC via the existing cron house pattern.
 """
@@ -74,8 +75,10 @@ def load_config(path: str = "config.toml") -> dict:
 def load_manifest(config: dict) -> dict:
     """Resolve the managed-repo manifest named by config [repos].manifest.
 
-    Returns {managed, audiences, cache_dir, manifest_path}. The clone cache defaults to
-    <manifest dir>/cache/repos (gitignored in the control home) unless [repos].workspace overrides it.
+    Returns {managed, audiences, cache_dir, cache_root, manifest_path}. The clone cache (cache_dir) defaults to
+    <manifest dir>/cache/repos unless [repos].workspace overrides it. The lookup cache root (cache_root) holds
+    the keyed TTL stores under cache_root/lookups and defaults to <manifest dir>/cache (the sibling parent of
+    the default clone cache) unless [cache].dir overrides it. Both are gitignored in the control home.
     """
     repos_cfg = config.get("repos", {})
     manifest_path = repos_cfg.get("manifest")
@@ -87,10 +90,13 @@ def load_manifest(config: dict) -> dict:
     manifest = _load_toml(mp)
     workspace = repos_cfg.get("workspace")
     cache_dir = Path(workspace).expanduser() if workspace else mp.parent / "cache" / "repos"
+    cache_cfg = config.get("cache", {})
+    cache_root = Path(cache_cfg["dir"]).expanduser() if cache_cfg.get("dir") else mp.parent / "cache"
     return {
         "managed": manifest.get("managed", {}),
         "audiences": manifest.get("audiences", {}),
         "cache_dir": cache_dir,
+        "cache_root": cache_root,
         "manifest_path": mp,
     }
 
@@ -184,6 +190,61 @@ def body_hash(body: str) -> str:
     return hashlib.sha256(body.strip().encode("utf-8")).hexdigest()
 
 
+# --- lookup cache (keyed JSON with a TTL; gitignored, tool-owned) -----------
+# A small, generic store for external lookups so a cron run does not re-fetch unchanged data every time. It
+# backs the git-fetch reuse in `index` today, and is ready for the Asana user resolution (about 24h) later.
+# A missing or corrupt cache is always a miss, never fatal: the tool re-fetches and re-stamps.
+
+def _parse_iso_utc(value) -> datetime | None:
+    """Parse the exact stamp _now_iso() writes ("%Y-%m-%dT%H:%M:%SZ"), tz-pinned UTC; None if unparseable."""
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _cache_file(cache_root, namespace: str) -> Path:
+    return Path(cache_root) / "lookups" / f"{namespace}.json"
+
+
+def _cache_load(cache_root, namespace: str) -> dict:
+    p = _cache_file(cache_root, namespace)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}  # a bad cache is a miss, not a crash
+
+
+def _cache_get(cache_root, namespace: str, key: str, ttl_seconds: int) -> tuple[bool, object]:
+    """Return (hit, value). A hit means the record exists and its age is within ttl_seconds (0 -> always miss)."""
+    if ttl_seconds <= 0:
+        return False, None
+    rec = _cache_load(cache_root, namespace).get(key)
+    if not isinstance(rec, dict):
+        return False, None
+    stored = _parse_iso_utc(rec.get("stored_utc"))
+    if stored is None:
+        return False, None
+    if (datetime.now(timezone.utc) - stored).total_seconds() > ttl_seconds:
+        return False, None
+    return True, rec.get("value")
+
+
+def _cache_set(cache_root, namespace: str, key: str, value) -> None:
+    p = _cache_file(cache_root, namespace)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    store = _cache_load(cache_root, namespace)
+    store[key] = {"value": value, "stored_utc": _now_iso()}
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(store, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(p)  # atomic on POSIX: no torn cache if the run dies mid-write
+
+
 # --- git + clone cache (manifest-driven index/sync) -------------------------
 
 def _git(args: list[str], cwd=None, timeout: int = 180) -> subprocess.CompletedProcess:
@@ -203,13 +264,26 @@ def _git(args: list[str], cwd=None, timeout: int = 180) -> subprocess.CompletedP
         return subprocess.CompletedProcess(["git", args[0] if args else "git"], 124, "", "timed out")
 
 
-def _refresh_clone(url: str, dest: Path) -> tuple[str | None, str]:
+def _refresh_clone(url: str, dest: Path, *, cache_root=None, ttl_seconds: int = 0,
+                   force: bool = False) -> tuple[str | None, str]:
     """Clone-if-absent, fetch, and hard-reset the tool-owned cache to the remote default branch.
 
     Returns (head_sha, status). A non-'ok' status means the repo was unreachable; the caller records it and
     carries on with the other repos rather than aborting the whole run (source-health over fail-fast).
+
+    With a cache_root and a positive ttl_seconds, an existing clone whose last successful fetch is within the
+    window is reused without touching the network: the working copy's current HEAD is returned and the status
+    stays exactly 'ok' (so callers gating on == 'ok' are unaffected; the skip shows only as an unchanged sha).
+    `sync` passes force=True so drift detection always fetches. Every real fetch re-stamps the cache.
     """
     dest = Path(dest)
+    key = dest.name
+    if (dest / ".git").exists() and not force and cache_root is not None:
+        hit, _ = _cache_get(cache_root, "git_fetch", key, ttl_seconds)
+        if hit:
+            head = _git(["rev-parse", "HEAD"], cwd=str(dest))
+            if head.returncode == 0:  # reuse the working copy; a failed rev-parse falls through to a refresh
+                return head.stdout.strip(), "ok"
     if not (dest / ".git").exists():
         dest.parent.mkdir(parents=True, exist_ok=True)
         if _git(["clone", "--quiet", url, str(dest)]).returncode != 0:
@@ -222,7 +296,10 @@ def _refresh_clone(url: str, dest: Path) -> tuple[str | None, str]:
     head = _git(["rev-parse", "HEAD"], cwd=str(dest))
     if head.returncode != 0:
         return None, "rev-parse failed"
-    return head.stdout.strip(), "ok"
+    head_sha = head.stdout.strip()
+    if cache_root is not None:  # stamp only a successful fetch, so an unreachable run retries next time
+        _cache_set(cache_root, "git_fetch", key, head_sha)
+    return head_sha, "ok"
 
 
 # --- nugget loading (shared by index, answer, rot) --------------------------
@@ -262,19 +339,22 @@ def _registry_entry(n: dict) -> dict:
     }
 
 
-def build_aggregate(manifest: dict) -> dict:
+def build_aggregate(manifest: dict, *, ttl_seconds: int = 0, force: bool = False) -> dict:
     """Walk every managed repo's refreshed clone and build the full cross-audience aggregate registry.
 
     Records each repo's resolved HEAD sha (the drift baseline sync diffs against) and tags every entry with
     its source_repo. Audience-scoped slicing (deriving each repo's published slice from this aggregate) is a
-    separate later chunk; this is the private full index only.
+    separate later chunk; this is the private full index only. ttl_seconds/force control the git-fetch reuse
+    cache: within ttl_seconds an unchanged repo is not re-fetched (0 -> always fetch; force -> always fetch).
     """
     cache_dir = manifest["cache_dir"]
+    cache_root = manifest["cache_root"]
     repos_out: dict = {}
     entries: list = []
     for key, spec in sorted(manifest["managed"].items()):
         url, audience = spec.get("url"), spec.get("audience")
-        head, status = _refresh_clone(url, cache_dir / key)
+        head, status = _refresh_clone(url, cache_dir / key, cache_root=cache_root,
+                                      ttl_seconds=ttl_seconds, force=force)
         repos_out[key] = {"url": url, "audience": audience, "head_sha": head, "status": status}
         if status != "ok":
             continue
@@ -356,8 +436,10 @@ def cmd_store(args) -> int:
 
 def cmd_index(args) -> int:
     if getattr(args, "manifest", False):
-        manifest = load_manifest(load_config(args.config))
-        agg = build_aggregate(manifest)
+        config = load_config(args.config)
+        manifest = load_manifest(config)
+        ttl = args.max_age if args.max_age is not None else int(config.get("cache", {}).get("fetch_ttl_seconds", 0))
+        agg = build_aggregate(manifest, ttl_seconds=ttl, force=args.force)
         out_path = (
             Path(args.out).expanduser() if args.out
             else manifest["manifest_path"].parent / "registry-aggregate.json"
@@ -548,12 +630,15 @@ def cmd_sync(args) -> int:
     rec_hash = {(e.get("source_repo"), e["id"]): e.get("content_hash") for e in recorded.get("entries", [])}
 
     cache_dir = manifest["cache_dir"]
+    cache_root = manifest["cache_root"]
     managed_keys = set(manifest["managed"])
     report: list[tuple[str, list[str]]] = []
 
     for key, spec in sorted(manifest["managed"].items()):
         lines: list[str] = []
-        head, status = _refresh_clone(spec.get("url"), cache_dir / key)
+        # Drift detection must be fresh: force a fetch (ignore the TTL) but still stamp the cache, so an
+        # `index` shortly after this sync can reuse the fetch.
+        head, status = _refresh_clone(spec.get("url"), cache_dir / key, cache_root=cache_root, force=True)
         if status != "ok":
             report.append((key, [f"UNREACHABLE: {status}"]))
             continue
@@ -609,6 +694,39 @@ def cmd_sync(args) -> int:
     return 0
 
 
+def cmd_cache(args) -> int:
+    """Inspect or clear the local, gitignored TTL lookup cache. Report-only unless --clear; exit 0.
+
+    Clearing removes only the tool-owned regenerable lookup stores under <cache_root>/lookups; it never
+    touches the clone cache, the manifest, or config.
+    """
+    manifest = load_manifest(load_config(args.config))
+    lookups = Path(manifest["cache_root"]) / "lookups"
+
+    if args.clear:
+        if not lookups.exists():
+            print(f"cache: nothing to clear at {lookups}.")
+            return 0
+        targets = ([lookups / f"{args.namespace}.json"] if args.namespace
+                   else sorted(lookups.glob("*.json")))
+        removed = 0
+        for f in targets:
+            if f.exists():
+                f.unlink()
+                removed += 1
+        scope = f"namespace '{args.namespace}'" if args.namespace else "all namespaces"
+        print(f"cache: cleared {scope} ({removed} store(s) removed) under {lookups}.")
+        return 0
+
+    if not lookups.exists() or not any(lookups.glob("*.json")):
+        print(f"cache: empty. No lookup stores under {lookups}.")
+        return 0
+    print(f"cache: lookup stores under {lookups}")
+    for f in sorted(lookups.glob("*.json")):
+        print(f"  {f.stem}: {len(_cache_load(manifest['cache_root'], f.stem))} entries")
+    return 0
+
+
 def _stub(name):
     def _run(args):
         print(f"{name}: not yet implemented (Phase 1b)", file=sys.stderr)
@@ -636,6 +754,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--config", default="config.toml", help="path to config.toml (used with --manifest)")
     sp.add_argument("--out",
                     help="output path; default stdout (single repo) or <manifest dir>/registry-aggregate.json")
+    sp.add_argument("--max-age", type=int, default=None, metavar="SECONDS",
+                    help="reuse a managed repo's clone without re-fetching if its last fetch is within this "
+                         "window (default: config [cache].fetch_ttl_seconds, else 0 = always fetch)")
+    sp.add_argument("--force", action="store_true", help="ignore the fetch cache and re-fetch every repo")
     sp.set_defaults(func=cmd_index)
 
     sp = sub.add_parser("answer", help="answer a query from stored nuggets")
@@ -654,6 +776,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--aggregate",
                     help="path to registry-aggregate.json (default: <manifest dir>/registry-aggregate.json)")
     sp.set_defaults(func=cmd_sync)
+
+    sp = sub.add_parser("cache", help="inspect or clear the local TTL lookup cache")
+    sp.add_argument("--config", default="config.toml", help="path to config.toml")
+    sp.add_argument("--clear", action="store_true", help="remove cached lookup stores (regenerated on demand)")
+    sp.add_argument("--namespace", help="limit --clear to one namespace (e.g. git_fetch)")
+    sp.set_defaults(func=cmd_cache)
 
     for name in ("prescan", "export", "feedback"):
         sp = sub.add_parser(name, help=f"{name} (Phase 1b)")

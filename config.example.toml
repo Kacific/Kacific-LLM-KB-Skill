@@ -21,3 +21,14 @@ manifest = "<path-to-private-repos.toml>"
 # Clone cache for manifest-driven `index --manifest` and `sync`: the tool clones and fetches each managed
 # repo here. Optional; defaults to <manifest dir>/cache/repos (gitignored in the control home).
 workspace = "<path-to-clone-cache>"
+
+[cache]
+# Local, gitignored TTL lookup cache (keyed JSON) for external lookups: git-fetch reuse now, the Asana user
+# resolution (about 24h) later. Optional; defaults to <manifest dir>/cache, a sibling of the clone cache, so
+# the keyed stores land under <cache dir>/lookups/. Inspect or clear it with `kb.py cache`.
+dir = "<path-to-cache-root>"
+# How long `index --manifest` may reuse a managed repo's clone before re-fetching, in seconds. 0 (the default)
+# always fetches. `sync` ALWAYS fetches and ignores this, since drift detection must be fresh. `index --force`
+# and `index --max-age 0` also force a fetch. A modest value (e.g. 900) deduplicates back-to-back index runs
+# without letting the baseline drift far; leave 0 to keep the fetch-every-run behaviour.
+fetch_ttl_seconds = 0
