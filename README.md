@@ -27,6 +27,7 @@ kb.py store <file>     validate a nugget against the schema and the anti-halluci
 kb.py index <repo>     rebuild the registry from a repo
 kb.py answer <query>   answer from stored nuggets only, with grounding and citation
 kb.py rot              hygiene sweep for redundant, outdated, or trivial nuggets
+kb.py cache            inspect or clear the local, gitignored TTL lookup cache
 kb.py sync|prescan|export|feedback   (Phase 1b and operations)
 ```
 
