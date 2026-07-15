@@ -93,6 +93,20 @@ def write_manifest(admin: Path, cache: Path, remotes: dict[str, tuple[str, str]]
     return cfg
 
 
+def commit_to_remote(root: Path, key: str, writes: dict | None = None, removes: list | None = None) -> None:
+    """Push a follow-up commit to a remote via its existing -work clone."""
+    work = root / f"{key}-work"
+    for rel, text in (writes or {}).items():
+        f = work / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text, encoding="utf-8")
+    for rel in (removes or []):
+        (work / rel).unlink()
+    git("-C", str(work), "add", "-A")
+    git("-C", str(work), "commit", "--quiet", "-m", "update")
+    git("-C", str(work), "push", "--quiet", "origin", "main")
+
+
 CHECKS = []
 
 
@@ -174,6 +188,77 @@ def index_manifest_flags_unreachable_repo():
             and all(e["source_repo"] == "allstaff" for e in agg["entries"])
         )
         return ok, f"ot_status={repos['ot']['status']!r} entries={len(agg['entries'])}"
+
+
+@check
+def sync_clean_then_detects_change_add_remove():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        admin = root / "admin"; admin.mkdir()
+        cache = root / "cache"
+        url_a = make_remote(root, "allstaff", {
+            "shared/wifi.md": nugget("shared-wifi", "shared", "Wifi", "Join the staff SSID to get online."),
+            "shared/printer.md": nugget("shared-printer", "shared", "Printer", "Use the third-floor printer."),
+        })
+        url_it = make_remote(root, "it", {
+            "it/vpn.md": nugget("it-vpn", "it", "VPN", "Use the corporate VPN profile from the pack."),
+        })
+        cfg = write_manifest(admin, cache, {"allstaff": (url_a, "AllStaff"), "it": (url_it, "IT")})
+        if kb("index", "--manifest", "--config", str(cfg)).returncode != 0:
+            return False, "baseline index failed"
+        clean = kb("sync", "--config", str(cfg))
+        # mutate allstaff: change wifi body, add a guide, remove the printer nugget
+        commit_to_remote(
+            root, "allstaff",
+            writes={
+                "shared/wifi.md": nugget("shared-wifi", "shared", "Wifi", "Join the NEW staff SSID and sign in once."),
+                "shared/guide.md": nugget("shared-guide", "shared", "Guide", "A brand new starter guide entry."),
+            },
+            removes=["shared/printer.md"],
+        )
+        drift = kb("sync", "--config", str(cfg))
+        out = drift.stdout
+        ok = (
+            clean.returncode == 0 and "clean" in clean.stdout
+            and drift.returncode == 0 and "clean" not in out
+            and "repo: allstaff" in out
+            and "repo changed:" in out
+            and "changed: shared-wifi" in out
+            and "added: shared-guide" in out
+            and "removed: shared-printer" in out
+            and "repo: it" not in out  # the unchanged repo produces no drift lines
+        )
+        return ok, f"clean={('clean' in clean.stdout)} drift_lines={[l for l in out.splitlines() if l.startswith('  - ')]}"
+
+
+@check
+def sync_flags_out_of_band_invalid_and_unmanaged():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        admin = root / "admin"; admin.mkdir()
+        cache = root / "cache"
+        url_a = make_remote(root, "allstaff", {
+            "shared/ok.md": nugget("shared-ok", "shared", "OK", "A properly grounded and sourced fact."),
+        })
+        cfg = write_manifest(admin, cache, {"allstaff": (url_a, "AllStaff")})
+        kb("index", "--manifest", "--config", str(cfg))
+        # an out-of-band edit that bypassed the store gate: a reference nugget with no source
+        bad = (
+            "---\nschema_version: 1\nid: shared-bad\ntitle: Bad\ndomain: shared\ntype: reference\n"
+            "status: published\nowner_gid: 0000000000000000\nprovenance_type: reference\n"
+            "confidence: low\nverified: 2020-01-01\n---\nAn ungrounded claim that never passed the gate.\n"
+        )
+        commit_to_remote(root, "allstaff", writes={"shared/bad.md": bad})
+        # a clone in the cache dir that is not in the manifest
+        git("clone", "--quiet", url_a, str(cache / "rogue"))
+        p = kb("sync", "--config", str(cfg))
+        out = p.stdout
+        ok = (
+            p.returncode == 0
+            and "out-of-band invalid nugget 'shared-bad'" in out
+            and "unmanaged" in out and "rogue" in out
+        )
+        return ok, f"stdout={out.strip()[:160]!r}"
 
 
 def main() -> int:
