@@ -523,6 +523,92 @@ def cmd_rot(args) -> int:
     return 0
 
 
+def _short(sha) -> str:
+    return sha[:8] if sha else "none"
+
+
+def cmd_sync(args) -> int:
+    """Reconcile the managed repos from git against the recorded aggregate; report drift, never guess.
+
+    Refreshes each managed clone, then diffs the live HEAD sha and per-nugget body hash against the recorded
+    registry-aggregate.json: repos whose HEAD moved, nuggets added / removed / changed, out-of-band edits
+    that fail the provenance gate, clones in the cache not in the manifest, and repos dropped from the
+    manifest. Report-only (raising these as tracking tasks is the separate feedback step); exit 0.
+    """
+    manifest = load_manifest(load_config(args.config))
+    agg_path = (
+        Path(args.aggregate).expanduser() if args.aggregate
+        else manifest["manifest_path"].parent / "registry-aggregate.json"
+    )
+    if not agg_path.exists():
+        print(f"sync: no recorded baseline at {agg_path}. Run `kb.py index --manifest` first.")
+        return 0
+    recorded = json.loads(agg_path.read_text(encoding="utf-8"))
+    rec_repos = recorded.get("repos", {})
+    rec_hash = {(e.get("source_repo"), e["id"]): e.get("content_hash") for e in recorded.get("entries", [])}
+
+    cache_dir = manifest["cache_dir"]
+    managed_keys = set(manifest["managed"])
+    report: list[tuple[str, list[str]]] = []
+
+    for key, spec in sorted(manifest["managed"].items()):
+        lines: list[str] = []
+        head, status = _refresh_clone(spec.get("url"), cache_dir / key)
+        if status != "ok":
+            report.append((key, [f"UNREACHABLE: {status}"]))
+            continue
+        rec_head = (rec_repos.get(key) or {}).get("head_sha")
+        if rec_head != head:
+            lines.append(f"repo changed: recorded {_short(rec_head)} -> live {_short(head)}")
+        live: dict = {}
+        for n in _load_nuggets(cache_dir / key):
+            nid = n["meta"].get("id")
+            live[nid] = n
+            errs = validate_entry(n["meta"], n["body"])
+            if errs:
+                lines.append(f"out-of-band invalid nugget '{nid}' ({n['path']}): {errs[0]}")
+        live_ids = set(live)
+        rec_ids = {i for (r, i) in rec_hash if r == key}
+        for nid in sorted(live_ids - rec_ids):
+            lines.append(f"added: {nid}")
+        for nid in sorted(rec_ids - live_ids):
+            lines.append(f"removed: {nid}")
+        for nid in sorted(live_ids & rec_ids):
+            if body_hash(live[nid]["body"]) != rec_hash[(key, nid)]:
+                lines.append(f"changed: {nid}")
+        report.append((key, lines))
+
+    unmanaged = []
+    if cache_dir.exists():
+        for child in sorted(cache_dir.iterdir()):
+            if child.is_dir() and (child / ".git").exists() and child.name not in managed_keys:
+                unmanaged.append(child.name)
+    dropped = sorted(set(rec_repos) - managed_keys)
+
+    if not any(lines for _, lines in report) and not unmanaged and not dropped:
+        print(f"sync: clean. {len(report)} managed repos, no drift.")
+        return 0
+
+    print(f"sync: drift detected across {len(report)} managed repos.\n")
+    for key, lines in report:
+        if lines:
+            print(f"repo: {key}")
+            for line in lines:
+                print(f"  - {line}")
+            print()
+    if unmanaged:
+        print("unmanaged (a clone in the cache, not in the manifest, needs triage):")
+        for name in unmanaged:
+            print(f"  - {name}")
+        print()
+    if dropped:
+        print("dropped (recorded in the aggregate but no longer in the manifest):")
+        for name in dropped:
+            print(f"  - {name}")
+        print()
+    return 0
+
+
 def _stub(name):
     def _run(args):
         print(f"{name}: not yet implemented (Phase 1b)", file=sys.stderr)
@@ -563,7 +649,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--repo", default=".", help="KB repo root to sweep (default: current dir)")
     sp.set_defaults(func=cmd_rot)
 
-    for name in ("sync", "prescan", "export", "feedback"):
+    sp = sub.add_parser("sync", help="drift-detect managed repos against the recorded aggregate")
+    sp.add_argument("--config", default="config.toml", help="path to config.toml")
+    sp.add_argument("--aggregate",
+                    help="path to registry-aggregate.json (default: <manifest dir>/registry-aggregate.json)")
+    sp.set_defaults(func=cmd_sync)
+
+    for name in ("prescan", "export", "feedback"):
         sp = sub.add_parser(name, help=f"{name} (Phase 1b)")
         sp.set_defaults(func=_stub(name))
 

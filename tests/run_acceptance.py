@@ -189,9 +189,10 @@ def rot_clean_on_fresh_repo():
 
 
 @check
-def stub_sync_reports_phase_1b():
+def sync_requires_manifest():
+    # With no config.toml in cwd, sync has no [repos].manifest to resolve and must say so, not guess.
     p = run("sync")
-    ok = "not yet implemented" in p.stderr
+    ok = p.returncode != 0 and "manifest" in p.stderr.lower()
     return ok, f"rc={p.returncode} stderr={p.stderr.strip()!r}"
 
 
