@@ -90,7 +90,7 @@ def write_manifest(admin: Path, cache: Path, remotes: dict[str, tuple[str, str]]
     lines = []
     for key, (url, audience) in remotes.items():
         lines += [f"[managed.{key}]", f'url = "{url}"', f'audience = "{audience}"', ""]
-    lines += ["[audiences]", 'AllStaff = ["AllStaff"]', 'IT = ["AllStaff", "IT"]', ""]
+    lines += ["[audiences]", 'AllStaff = ["AllStaff"]', 'Technical = ["AllStaff", "Technical"]', ""]
     for key, spec in (seeds or {}).items():
         lines += [f"[seed_sources.{key}]"]
         for k, v in spec.items():
@@ -148,11 +148,11 @@ def index_manifest_builds_aggregate():
                 }),
                 "AllStaff",
             ),
-            "it": (
-                make_remote(root, "it", {
-                    "it/vpn.md": nugget("it-vpn", "it", "VPN", "Use the corporate VPN profile."),
+            "technical": (
+                make_remote(root, "technical", {
+                    "technical/vpn.md": nugget("tech-vpn", "technical", "VPN", "Use the corporate VPN profile."),
                 }),
-                "IT",
+                "Technical",
             ),
         }
         cfg = write_manifest(admin, cache, {k: v for k, v in remotes.items()})
@@ -167,13 +167,13 @@ def index_manifest_builds_aggregate():
         entries = agg.get("entries", [])
         ok = (
             agg.get("schema_version") == 1
-            and set(repos) == {"allstaff", "it"}
+            and set(repos) == {"allstaff", "technical"}
             and all(r["status"] == "ok" and r["head_sha"] and len(r["head_sha"]) == 40 for r in repos.values())
-            and repos["allstaff"]["audience"] == "AllStaff" and repos["it"]["audience"] == "IT"
+            and repos["allstaff"]["audience"] == "AllStaff" and repos["technical"]["audience"] == "Technical"
             and len(entries) == 3
-            and all(e.get("source_repo") in {"allstaff", "it"} for e in entries)
+            and all(e.get("source_repo") in {"allstaff", "technical"} for e in entries)
             and all(e.get("content_hash") for e in entries)
-            and {e["source_repo"] for e in entries} == {"allstaff", "it"}
+            and {e["source_repo"] for e in entries} == {"allstaff", "technical"}
         )
         detail = f"repos={list(repos)} entries={len(entries)} sources={sorted({e.get('source_repo') for e in entries})}"
         # A second run must be idempotent (clone cache reused, same head shas).
@@ -219,10 +219,10 @@ def sync_clean_then_detects_change_add_remove():
             "shared/wifi.md": nugget("shared-wifi", "shared", "Wifi", "Join the staff SSID to get online."),
             "shared/printer.md": nugget("shared-printer", "shared", "Printer", "Use the third-floor printer."),
         })
-        url_it = make_remote(root, "it", {
-            "it/vpn.md": nugget("it-vpn", "it", "VPN", "Use the corporate VPN profile from the pack."),
+        url_it = make_remote(root, "technical", {
+            "technical/vpn.md": nugget("tech-vpn", "technical", "VPN", "Use the corporate VPN profile from the pack."),
         })
-        cfg = write_manifest(admin, cache, {"allstaff": (url_a, "AllStaff"), "it": (url_it, "IT")})
+        cfg = write_manifest(admin, cache, {"allstaff": (url_a, "AllStaff"), "technical": (url_it, "Technical")})
         if kb("index", "--manifest", "--config", str(cfg)).returncode != 0:
             return False, "baseline index failed"
         clean = kb("sync", "--config", str(cfg))
@@ -245,7 +245,7 @@ def sync_clean_then_detects_change_add_remove():
             and "changed: shared-wifi" in out
             and "added: shared-guide" in out
             and "removed: shared-printer" in out
-            and "repo: it" not in out  # the unchanged repo produces no drift lines
+            and "repo: technical" not in out  # the unchanged repo produces no drift lines
         )
         return ok, f"clean={('clean' in clean.stdout)} drift_lines={[l for l in out.splitlines() if l.startswith('  - ')]}"
 
@@ -444,7 +444,7 @@ def prescan_commit_stages_gate_clean_candidates():
         admin = root / "admin"; admin.mkdir()
         seed = _seed_dir(root)
         cfg = write_manifest(admin, root / "cache", {},
-                             seeds={"estate": {"path": str(seed), "domain": "shared", "audience": "IT"}})
+                             seeds={"estate": {"path": str(seed), "domain": "shared", "audience": "Technical"}})
         p = kb("prescan", "--config", str(cfg), "--commit",
                "--owner-gid", "0000000000000000", "--owner-name", "Example Owner")
         if p.returncode != 0:

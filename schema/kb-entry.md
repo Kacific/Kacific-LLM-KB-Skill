@@ -12,7 +12,7 @@ purpose: it carries no site-specific identifiers.
 schema_version: 1              # integer; bump only for a breaking change (see forward-compatibility below)
 id: <stable-kebab-slug>        # unique within the KB; never reused
 title: <human title>           # searchable, plain language, no internal jargon
-domain: it | ot | shared | company
+domain: technical | commercial | admin | finance | hr | shared | company
 type: how-to | troubleshooting | faq | known-issue | reference | fact | glossary
 status: draft | published | needs-update | archived | retired
 owner_gid: <asana-user-gid>    # a real, routable owner (see ownership)

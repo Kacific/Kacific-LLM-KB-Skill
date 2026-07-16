@@ -40,7 +40,7 @@ from pathlib import Path
 # Python 3. Only config-dependent commands need Python 3.11+ (stdlib tomllib) or the tomli backport.
 
 SCHEMA_VERSION = 1
-VALID_DOMAINS = {"it", "ot", "shared", "company"}
+VALID_DOMAINS = {"technical", "commercial", "admin", "finance", "hr", "shared", "company"}
 VALID_TYPES = {"how-to", "troubleshooting", "faq", "known-issue", "reference", "fact", "glossary"}
 VALID_STATUS = {"draft", "published", "needs-update", "archived", "retired"}
 ROT_OUTDATED_DAYS = 30
