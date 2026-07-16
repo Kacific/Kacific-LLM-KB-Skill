@@ -2,7 +2,7 @@
 schema_version: 1
 id: it-password-rotation-duplicate
 title: Password rotation reminder
-domain: it
+domain: technical
 type: reference
 status: published
 owner_gid: 0000000000000000

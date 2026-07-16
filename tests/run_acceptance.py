@@ -29,7 +29,7 @@ import kb  # noqa: E402
 
 MISS = kb.MISS_RESPONSE
 
-VALID_REFERENCE = FIXTURE_KB / "it" / "password-rotation-a.md"
+VALID_REFERENCE = FIXTURE_KB / "technical" / "password-rotation-a.md"
 VALID_ATTESTATION = FIXTURE_KB / "shared" / "vpn-reset.md"
 
 
@@ -123,7 +123,7 @@ def store_refuse_missing_required():
 def store_into_writes_by_domain():
     with tempfile.TemporaryDirectory() as d:
         p = run("store", str(VALID_REFERENCE), "--into", d)
-        dest = Path(d) / "it" / "it-password-rotation-standard.md"
+        dest = Path(d) / "technical" / "it-password-rotation-standard.md"
         ok = p.returncode == 0 and dest.exists()
         return ok, f"rc={p.returncode} exists={dest.exists()} stdout={p.stdout.strip()!r}"
 
