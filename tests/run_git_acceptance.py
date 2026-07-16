@@ -21,6 +21,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 KB_PY = REPO_ROOT / "kb.py"
 
+# In-process access for validating staged prescan candidates against the real store gate.
+sys.path.insert(0, str(REPO_ROOT))
+import kb as kb_mod  # noqa: E402
+
 
 def kb(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
@@ -36,7 +40,7 @@ def git(*args: str) -> subprocess.CompletedProcess:
     return r
 
 
-def nugget(nid: str, domain: str, title: str, body: str) -> str:
+def nugget(nid: str, domain: str, title: str, body: str, source: str | None = None) -> str:
     return (
         "---\n"
         "schema_version: 1\n"
@@ -48,7 +52,7 @@ def nugget(nid: str, domain: str, title: str, body: str) -> str:
         "owner_gid: 0000000000000000\n"
         "owner_name: Example Owner\n"
         "provenance_type: reference\n"
-        "source: https://example.invalid/docs/" + nid + "\n"
+        f"source: {source or 'https://example.invalid/docs/' + nid}\n"
         "confidence: high\n"
         "verified: 2020-01-01\n"
         "---\n"
@@ -77,15 +81,24 @@ def make_remote(root: Path, key: str, files: dict[str, str]) -> str:
 
 
 def write_manifest(admin: Path, cache: Path, remotes: dict[str, tuple[str, str]],
-                   cache_ttl: int | None = None) -> Path:
+                   cache_ttl: int | None = None, seeds: dict[str, dict] | None = None) -> Path:
     """Write repos.toml + config.toml under admin/; return the config path.
 
     cache_ttl, when given, adds a [cache] fetch_ttl_seconds line so the git-fetch reuse cache is exercised.
+    seeds, when given, adds [seed_sources.<key>] blocks (string or list values) for prescan checks.
     """
     lines = []
     for key, (url, audience) in remotes.items():
         lines += [f"[managed.{key}]", f'url = "{url}"', f'audience = "{audience}"', ""]
     lines += ["[audiences]", 'AllStaff = ["AllStaff"]', 'IT = ["AllStaff", "IT"]', ""]
+    for key, spec in (seeds or {}).items():
+        lines += [f"[seed_sources.{key}]"]
+        for k, v in spec.items():
+            if isinstance(v, list):
+                lines += [f"{k} = [" + ", ".join(f'"{x}"' for x in v) + "]"]
+            else:
+                lines += [f'{k} = "{v}"']
+        lines += [""]
     (admin / "repos.toml").write_text("\n".join(lines), encoding="utf-8")
     cfg = admin / "config.toml"
     cfg_text = (
@@ -364,6 +377,195 @@ def cache_subcommand_reports_and_clears():
             and empt.returncode == 0 and "empty" in empt.stdout
         )
         return ok, f"report_has_git_fetch={'git_fetch' in rep.stdout} cleared={'cleared' in clr.stdout} empty={'empty' in empt.stdout}"
+
+
+# --- prescan (seed sources -> ranked pointer candidates) ---------------------
+
+CANARY = "CANARY-SECRET-VALUE-XYZZY-DO-NOT-PRINT"
+
+
+def _seed_dir(root: Path) -> Path:
+    """A plain (non-git) path seed source with prose, a secret canary, a binary, and an id collision."""
+    seed = root / "seed-src"
+    guide = (
+        "# Setting up the estate\n\n"
+        "The first paragraph explains the setup " + chr(0x2014) + " including the awkward punctuation "
+        "the voice gate must never let through into a staged candidate abstract.\n\n"
+        "## Second heading\n\nMore detail follows in later sections.\n"
+    )
+    files = {
+        "guides/setup.md": guide,
+        "a/notes.md": "Some brief notes that still clear the trivial threshold comfortably.\n",
+        "a-notes.md": "A different file whose slug collides with the nested notes file above.\n",
+        "config.py": f"token = '{CANARY}'\n",
+        "deploy-secrets.md": f"# Secrets\n\n{CANARY}\n",
+    }
+    for rel, text in files.items():
+        f = seed / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(text, encoding="utf-8")
+    (seed / "broken-export.md").write_bytes(b"\x00\x01binary blob masquerading as markdown")
+    return seed
+
+
+@check
+def prescan_dry_run_reports_and_writes_nothing():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        admin = root / "admin"; admin.mkdir()
+        seed = _seed_dir(root)
+        cfg = write_manifest(admin, root / "cache", {}, seeds={"estate": {"path": str(seed)}})
+        p = kb("prescan", "--config", str(cfg))
+        counts_ok = ("candidates=3" in p.stdout and "skipped-secret=2" in p.stdout
+                     and "skipped-binary=1" in p.stdout)
+        no_canary = CANARY not in p.stdout and CANARY not in p.stderr
+        no_writes = not (admin / "prescan-out").exists() and not (admin / "prescan-report.json").exists()
+        ok = p.returncode == 0 and counts_ok and no_canary and no_writes
+        return ok, f"rc={p.returncode} counts_ok={counts_ok} no_canary={no_canary} no_writes={no_writes}"
+
+
+@check
+def prescan_commit_refuses_without_owner():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        admin = root / "admin"; admin.mkdir()
+        seed = _seed_dir(root)
+        cfg = write_manifest(admin, root / "cache", {}, seeds={"estate": {"path": str(seed)}})
+        p = kb("prescan", "--config", str(cfg), "--commit")
+        ok = (p.returncode == 2 and "owner" in p.stderr
+              and not (admin / "prescan-out").exists() and not (admin / "prescan-report.json").exists())
+        return ok, f"rc={p.returncode} stderr={p.stderr.strip()[:100]!r}"
+
+
+@check
+def prescan_commit_stages_gate_clean_candidates():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        admin = root / "admin"; admin.mkdir()
+        seed = _seed_dir(root)
+        cfg = write_manifest(admin, root / "cache", {},
+                             seeds={"estate": {"path": str(seed), "domain": "shared", "audience": "IT"}})
+        p = kb("prescan", "--config", str(cfg), "--commit",
+               "--owner-gid", "0000000000000000", "--owner-name", "Example Owner")
+        if p.returncode != 0:
+            return False, f"rc={p.returncode} stderr={p.stderr.strip()[:160]!r}"
+        staged = sorted((admin / "prescan-out" / "estate").glob("*.md"))
+        names = [f.name for f in staged]
+        problems = []
+        titles = {}
+        for f in staged:
+            meta, body = kb_mod.parse_frontmatter(f.read_text(encoding="utf-8"))
+            errors = kb_mod.validate_entry(meta, body)
+            if errors:
+                problems.append(f"{f.name}: {errors}")
+            if meta.get("status") != "draft" or meta.get("provenance_type") != "reference" or not meta.get("source"):
+                problems.append(f"{f.name}: wrong draft/reference/source shape")
+            if chr(0x2014) in body:
+                problems.append(f"{f.name}: em-dash reached the staged abstract")
+            titles[f.name] = meta.get("title")
+        report = json.loads((admin / "prescan-report.json").read_text())
+        est = report["sources"]["estate"]
+        ok = (
+            len(staged) == 3
+            and not problems
+            and not any("config" in n or "secret" in n for n in names)
+            and len(set(names)) == 3  # the a/notes.md vs a-notes.md collision got distinct ids
+            and "Setting up the estate" in titles.values()
+            and est["counts"]["skipped_secret"] == 2
+            and est["counts"]["candidates"] == 3
+        )
+        return ok, f"staged={names} problems={problems[:2]} titles={sorted(titles.values())}"
+
+
+@check
+def prescan_url_seed_dedups_against_registry():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        admin = root / "admin"; admin.mkdir()
+        cache = root / "cache"
+        seed_url = make_remote(root, "seedkb", {
+            "runbooks/triage.md": "# Network triage\n\nStart from the router and work outward to hosts.\n",
+            "runbooks/backups.md": "# Backup checks\n\nConfirm the nightly capture landed before changes.\n",
+        })
+        data_url = make_remote(root, "allstaff", {
+            "shared/wifi.md": nugget("shared-wifi", "shared", "Wifi", "Join the staff SSID to get online."),
+        })
+        cfg = write_manifest(admin, cache, {"allstaff": (data_url, "AllStaff")},
+                             seeds={"docs": {"url": seed_url}})
+        owner = ("--owner-gid", "0000000000000000", "--owner-name", "Example Owner")
+        if kb("index", "--manifest", "--config", str(cfg)).returncode != 0:
+            return False, "baseline index failed"
+        p1 = kb("prescan", "--config", str(cfg), "--commit", *owner)
+        staged1 = sorted((admin / "prescan-out" / "docs").glob("*.md"))
+        if p1.returncode != 0 or len(staged1) != 2:
+            return False, f"first commit rc={p1.returncode} staged={len(staged1)}"
+        report1 = json.loads((admin / "prescan-report.json").read_text())
+        if not report1["sources"]["docs"].get("head_sha"):
+            return False, "url seed did not record a head sha"
+        # Land one staged candidate's source as a real nugget, re-index, and rescan: it must dedup out.
+        triage = next(f for f in staged1 if "triage" in f.name)
+        meta, _ = kb_mod.parse_frontmatter(triage.read_text(encoding="utf-8"))
+        commit_to_remote(root, "allstaff", writes={
+            "shared/triage-pointer.md": nugget("shared-triage-pointer", "shared", "Triage pointer",
+                                               "Pointer to the triage runbook in the docs seed.",
+                                               source=meta["source"]),
+        })
+        if kb("index", "--manifest", "--config", str(cfg), "--force").returncode != 0:
+            return False, "re-index failed"
+        p2 = kb("prescan", "--config", str(cfg), "--commit", *owner)
+        staged2 = [f.name for f in sorted((admin / "prescan-out" / "docs").glob("*.md"))]
+        report2 = json.loads((admin / "prescan-report.json").read_text())
+        counts2 = report2["sources"]["docs"]["counts"]
+        ok = (
+            p2.returncode == 0
+            and counts2["already_captured"] == 1 and counts2["candidates"] == 1
+            and len(staged2) == 1 and "triage" not in staged2[0]
+        )
+        return ok, f"counts2={counts2} staged2={staged2}"
+
+
+@check
+def prescan_repo_level_pointer_does_not_suppress():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        admin = root / "admin"; admin.mkdir()
+        cache = root / "cache"
+        seed_url = make_remote(root, "seedkb", {
+            "runbooks/triage.md": "# Network triage\n\nStart from the router and work outward to hosts.\n",
+        })
+        data_url = make_remote(root, "allstaff", {
+            "shared/kb-pointer.md": nugget("shared-kb-pointer", "shared", "Estate KB",
+                                           "Whole-repo pointer to the seed knowledge base.",
+                                           source=seed_url),
+        })
+        cfg = write_manifest(admin, cache, {"allstaff": (data_url, "AllStaff")},
+                             seeds={"docs": {"url": seed_url}})
+        if kb("index", "--manifest", "--config", str(cfg)).returncode != 0:
+            return False, "baseline index failed"
+        p = kb("prescan", "--config", str(cfg))
+        ok = (p.returncode == 0 and "repo-level pointer" in p.stdout
+              and "candidates=1" in p.stdout and "runbooks/triage.md" in p.stdout)
+        return ok, f"rc={p.returncode} stdout={p.stdout.strip()[:200]!r}"
+
+
+@check
+def prescan_path_seed_skips_clone():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        admin = root / "admin"; admin.mkdir()
+        make_remote(root, "seedkb", {
+            "runbooks/triage.md": "# Network triage\n\nStart from the router and work outward to hosts.\n",
+        })
+        work = root / "seedkb-work"  # the existing local clone; prescan must not clone its own copy
+        cfg = write_manifest(admin, root / "cache", {}, seeds={"local": {"path": str(work)}})
+        p = kb("prescan", "--config", str(cfg), "--commit",
+               "--owner-gid", "0000000000000000", "--owner-name", "Example Owner")
+        report = json.loads((admin / "prescan-report.json").read_text())
+        src = report["sources"]["local"]
+        no_clone = not (admin / "cache" / "seeds").exists() and not (root / "cache").exists()
+        ok = (p.returncode == 0 and src["status"] == "ok" and bool(src.get("head_sha"))
+              and src["counts"]["candidates"] == 1 and no_clone)
+        return ok, f"rc={p.returncode} head={bool(src.get('head_sha'))} no_clone={no_clone}"
 
 
 def main() -> int:

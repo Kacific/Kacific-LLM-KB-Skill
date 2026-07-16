@@ -10,7 +10,8 @@ Subcommands:
   answer    answer a query using only stored nuggets, with grounding, citation, and confidence
   rot       hygiene sweep: flag Redundant / Outdated (verified > 30 days) / Trivial; emit a report
   sync      git-fetch each managed repo, diff SHA and per-nugget body hash, report drift (1b)
-  prescan   one-time extraction of existing repos and KBs to seed the registry (secrets-safe)
+  prescan   one-time seed: scan the manifest's seed-source repos into ranked pointer candidates plus a
+            captured-vs-gap report; --commit stages them for human review (secrets-safe by name)
   export    render a neutral bundle (Markdown/HTML) for an export target (1b)
   feedback  append a usage/rating/miss record, or report gap/ROT/conflict findings; --commit reconciles
             them into the tracking project as Asana tasks (create/no-op/verify-clear/reopen) (1b)
@@ -21,9 +22,11 @@ Run one-off by hand, or schedule sync/rot/index on the NUC via the existing cron
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -80,7 +83,7 @@ def load_config(path: str = "config.toml") -> dict:
 def load_manifest(config: dict) -> dict:
     """Resolve the managed-repo manifest named by config [repos].manifest.
 
-    Returns {managed, audiences, cache_dir, cache_root, manifest_path}. The clone cache (cache_dir) defaults to
+    Returns {managed, audiences, seed_sources, cache_dir, cache_root, manifest_path}. The clone cache (cache_dir) defaults to
     <manifest dir>/cache/repos unless [repos].workspace overrides it. The lookup cache root (cache_root) holds
     the keyed TTL stores under cache_root/lookups and defaults to <manifest dir>/cache (the sibling parent of
     the default clone cache) unless [cache].dir overrides it. Both are gitignored in the control home.
@@ -100,6 +103,7 @@ def load_manifest(config: dict) -> dict:
     return {
         "managed": manifest.get("managed", {}),
         "audiences": manifest.get("audiences", {}),
+        "seed_sources": manifest.get("seed_sources", {}),
         "cache_dir": cache_dir,
         "cache_root": cache_root,
         "manifest_path": mp,
@@ -136,6 +140,39 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
         else:
             meta[key] = raw.strip('"').strip("'")
     return meta, body
+
+
+_FM_FIELD_ORDER = [
+    "schema_version", "id", "title", "domain", "type", "status", "owner_gid", "owner_name",
+    "provenance_type", "source", "attested_by", "attested_on", "confidence", "verified",
+    "supersedes", "related", "tags",
+]
+
+
+def emit_frontmatter(meta: dict, body: str) -> str:
+    """Serialise a flat meta dict plus body into the nugget file format parse_frontmatter reads back.
+
+    The inverse of parse_frontmatter for the controlled schema: known fields in schema order, unknown
+    fields after them sorted, inline [a, b] lists, None as null. Values are collapsed to one line and
+    quoted when they would otherwise misparse (leading bracket or quote). Round-trip contract: parsing
+    the output yields the same meta (scalars normalised to strings) and the same body.
+    """
+    def fmt(value) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, list):
+            return "[" + ", ".join(" ".join(str(v).replace(",", " ").split()) for v in value) + "]"
+        s = " ".join(str(value).split())
+        if not s:
+            return "null"
+        if s[0] in "[\"'" or s[-1] in "]\"'":
+            s = '"' + s.strip('"').strip("'") + '"'
+        return s
+
+    keys = [k for k in _FM_FIELD_ORDER if k in meta]
+    keys += sorted(k for k in meta if k not in _FM_FIELD_ORDER)
+    lines = ["---"] + [f"{k}: {fmt(meta[k])}" for k in keys] + ["---", ""]
+    return "\n".join(lines) + body
 
 
 def _as_list(value) -> list:
@@ -1371,6 +1408,342 @@ def cmd_feedback(args) -> int:
     return 0
 
 
+# --- prescan: seed-source scan -> ranked pointer candidates ------------------
+# One-time bulk seeder. Scans each [seed_sources] repo from the manifest and turns every matching file into
+# a ranked POINTER candidate (frontmatter + source + a one-line abstract, never a content copy). Report-only
+# by default; --commit stages candidates under <manifest dir>/prescan-out/ for human review, and keepers then
+# enter the KB through the normal `store --into` gate. Secrets-safe by construction: files that look like
+# credential stores are skipped BY NAME before any open().
+
+_SECRET_EXACT = {"config.py", "config.ini", "config.toml", ".env", ".envrc"}
+_SECRET_GLOBS = ("*.pem", "*.key", "id_rsa*", "*credential*", "*secret*")
+_BOILERPLATE_STEMS = {"readme", "index", "changelog", "license", "contributing"}
+_ABSTRACT_MAX_CHARS = 200
+
+
+def _is_secret_name(name: str) -> bool:
+    low = name.lower()
+    return low in _SECRET_EXACT or any(fnmatch.fnmatch(low, g) for g in _SECRET_GLOBS)
+
+
+def _looks_binary(path: Path) -> bool:
+    try:
+        with path.open("rb") as fh:
+            return b"\0" in fh.read(1024)
+    except OSError:
+        return True
+
+
+def _glob_match(rel: str, patterns: list) -> bool:
+    """fnmatch over a POSIX relative path; a leading **/ also matches files at the repo root."""
+    for g in patterns:
+        if fnmatch.fnmatch(rel, g) or (g.startswith("**/") and fnmatch.fnmatch(rel, g[3:])):
+            return True
+    return False
+
+
+def _slugify(text: str, max_len: int = 60) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-")
+    return slug[:max_len].rstrip("-") or "item"
+
+
+def _plain_voice(text: str) -> str:
+    """Collapse whitespace and swap em/en dashes so generated prose passes the voice gate."""
+    return " ".join(str(text).replace(chr(0x2014), ", ").replace(chr(0x2013), "-").split())
+
+
+def _seed_source_url(remote: str | None, sha: str | None, relpath: str) -> str:
+    """A source string for a candidate: a GitHub blob URL pinned to HEAD when derivable, else path-style."""
+    m = re.match(r"(?:https://github\.com/|git@github\.com:)([^/]+/[^/]+?)(?:\.git)?/?$", remote or "")
+    if m and sha:
+        return f"https://github.com/{m.group(1)}/blob/{sha}/{urllib.parse.quote(relpath)}"
+    base = (remote or "").rstrip("/")
+    if base.endswith(".git"):
+        base = base[:-4]
+    return f"{base}/{relpath}" if base else relpath
+
+
+def _norm_source(source) -> str:
+    """Normalise a source string for dedup: GitHub blob URLs reduce to repo+path ignoring the ref."""
+    s = str(source or "").strip().rstrip("/")
+    if s.endswith(".git"):
+        s = s[:-4]
+    m = re.match(r"https://github\.com/([^/]+/[^/]+)/blob/[^/]+/(.+)$", s)
+    if m:
+        return f"github:{m.group(1)}/{urllib.parse.unquote(m.group(2))}"
+    m = re.match(r"(?:https://github\.com/|git@github\.com:)([^/]+/[^/]+)$", s)
+    if m:
+        return f"github:{m.group(1)}"
+    return s
+
+
+def _extract_title_abstract(text: str, fallback_name: str, markdown: bool) -> tuple[str, str]:
+    """Title from the first heading (or the filename), abstract from the first prose paragraph.
+
+    Index from content, never the filename: the stem is only the last-resort title. A Markdown source with
+    its own frontmatter contributes its title field and is scanned by body only. Non-Markdown files fall
+    back to the first comment or docstring line.
+    """
+    title = ""
+    para: list[str] = []
+    if markdown:
+        fm_meta, fm_body = parse_frontmatter(text)
+        if fm_meta:
+            title = str(fm_meta.get("title") or "")
+            text = fm_body
+        in_fence = False
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("```"):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
+            if s.startswith("#"):
+                if not title:
+                    title = s.lstrip("#").strip()
+                if para:
+                    break
+                continue
+            if s:
+                para.append(s)
+            elif para:
+                break
+    else:
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith("#!"):
+                continue
+            s = s.lstrip("#/ ").strip().strip('"').strip("'").strip()
+            if s:
+                para.append(s)
+                break
+    if not title:
+        stem = Path(fallback_name).stem
+        words = re.sub(r"[-_]+", " ", stem).strip()
+        title = (words[:1].upper() + words[1:]) if words else stem
+    return _plain_voice(title), _plain_voice(" ".join(para))
+
+
+def _candidate_score(text: str, relpath: str, last_commit: str | None) -> tuple[int, dict]:
+    """A small transparent additive score; the parts are echoed in the report so ranking is auditable."""
+    words = len(text.split())
+    headings = sum(1 for line in text.splitlines() if line.lstrip().startswith("#"))
+    parts = {
+        "substance": min(words // 100, 10),
+        "structure": min(2 * headings, 10),
+        "recency": 0,
+        "depth": -max(len(Path(relpath).parts) - 2, 0),
+        "boilerplate": -5 if Path(relpath).stem.lower() in _BOILERPLATE_STEMS else 0,
+    }
+    commit_date = _iso_date(last_commit)
+    if commit_date:
+        age_days = (datetime.now(timezone.utc) - commit_date).days
+        parts["recency"] = 5 if age_days <= 180 else (2 if age_days <= 730 else 0)
+    return sum(parts.values()), parts
+
+
+def _candidate_abstract(raw: str, relpath: str, key: str) -> str:
+    abstract = raw
+    if len(abstract) > _ABSTRACT_MAX_CHARS:
+        abstract = abstract[:_ABSTRACT_MAX_CHARS].rsplit(" ", 1)[0].rstrip(" ,;:.") + "."
+    if not abstract:
+        abstract = f"Pointer to {relpath} in the {key} seed source."
+    if not abstract.endswith((".", "!", "?")):
+        abstract += "."
+    if len(abstract) < TRIVIAL_BODY_CHARS:  # keep a fresh candidate out of the rot sweep's trivial flag
+        abstract += " See the source document for the full detail."
+    return abstract
+
+
+def _scan_seed_source(key: str, spec: dict, root: Path, remote: str | None, sha: str | None,
+                      captured: set) -> dict:
+    """Walk one seed source and return its counts plus ranked candidates. Never opens a secret-named file."""
+    include = _as_list(spec.get("include")) or ["**/*.md"]
+    exclude = _as_list(spec.get("exclude"))
+    counts = {"candidates": 0, "already_captured": 0,
+              "skipped_secret": 0, "skipped_binary": 0, "skipped_glob": 0}
+    candidates: list[dict] = []
+    seen_ids: dict = {}
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or ".git" in path.parts:
+            continue
+        rel = path.relative_to(root).as_posix()
+        if _is_secret_name(path.name):  # by name, before any open()
+            counts["skipped_secret"] += 1
+            continue
+        if not _glob_match(rel, include) or (exclude and _glob_match(rel, exclude)):
+            counts["skipped_glob"] += 1
+            continue
+        if _looks_binary(path):
+            counts["skipped_binary"] += 1
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            counts["skipped_binary"] += 1
+            continue
+        cid = f"seed-{_slugify(key, 20)}-{_slugify(rel.rsplit('.', 1)[0] if '.' in path.name else rel)}"
+        dup = seen_ids.get(cid, 0) + 1
+        seen_ids[cid] = dup
+        if dup > 1:
+            cid = f"{cid}-{dup}"
+        last_commit = None
+        if sha:  # the root is a git repo, so ask for the file's last commit date
+            r = _git(["log", "-1", "--format=%cs", "--", rel], cwd=str(root))
+            if r.returncode == 0:
+                last_commit = r.stdout.strip() or None
+        score, parts = _candidate_score(text, rel, last_commit)
+        title, raw_abstract = _extract_title_abstract(text, path.name, path.suffix.lower() == ".md")
+        source = _seed_source_url(remote, sha, rel)
+        cap = _norm_source(source) in captured
+        counts["already_captured" if cap else "candidates"] += 1
+        candidates.append({
+            "id": cid, "title": title, "abstract": _candidate_abstract(raw_abstract, rel, key),
+            "relpath": rel, "source": source, "score": score, "score_parts": parts, "captured": cap,
+        })
+    candidates.sort(key=lambda c: (-c["score"], c["relpath"]))
+    return {"counts": counts, "candidates": candidates}
+
+
+def cmd_prescan(args) -> int:
+    """Scan the manifest's [seed_sources] into ranked pointer candidates plus a captured-vs-gap report.
+
+    Report-only by default (zero writes beyond the tool-owned clone cache for url sources). With --commit
+    it stages the non-captured candidates under <manifest dir>/prescan-out/<key>/ and writes
+    prescan-report.json next to the manifest; --owner-gid/--owner-name (the reviewing human, who owns the
+    draft candidates) are required for --commit. Keepers land via the normal `store --into` gate.
+    """
+    if args.commit and not (args.owner_gid and args.owner_name):
+        print("prescan --commit: --owner-gid and --owner-name are required "
+              "(the reviewing human owns the staged candidates).", file=sys.stderr)
+        return 2
+    config = load_config(args.config)
+    manifest = load_manifest(config)
+    seeds = manifest["seed_sources"]
+    if args.source:
+        seeds = {k: v for k, v in seeds.items() if k == args.source}
+        if not seeds:
+            print(f"prescan: no seed source named '{args.source}' in the manifest.", file=sys.stderr)
+            return 2
+    if not seeds:
+        print("prescan: [seed_sources] is empty in the manifest; nothing to scan.")
+        return 0
+
+    # Dedup baseline: what the KB already points at, from the recorded aggregate registry.
+    agg_path = (Path(args.aggregate).expanduser() if args.aggregate
+                else manifest["manifest_path"].parent / "registry-aggregate.json")
+    captured: set = set()
+    if agg_path.exists():
+        try:
+            agg = json.loads(agg_path.read_text(encoding="utf-8"))
+            captured = {_norm_source(e["source_document"])
+                        for e in agg.get("entries", []) if e.get("source_document")}
+        except (json.JSONDecodeError, OSError):
+            print(f"prescan: WARN: unreadable aggregate at {agg_path}; dedup disabled.", file=sys.stderr)
+    else:
+        print(f"prescan: note: no aggregate at {agg_path}; dedup against existing nuggets disabled.")
+
+    ttl = args.max_age if args.max_age is not None else int(config.get("cache", {}).get("fetch_ttl_seconds", 0))
+    results: dict = {}
+    for key, spec in sorted(seeds.items()):
+        kind = spec.get("kind", "pointer")
+        if kind != "pointer":
+            results[key] = {"status": f"skipped (unsupported kind: {kind})"}
+            continue
+        if spec.get("path"):
+            root = Path(spec["path"]).expanduser()
+            if not root.is_dir():
+                results[key] = {"status": "unreachable (path not found)"}
+                continue
+            remote_r = _git(["remote", "get-url", "origin"], cwd=str(root))
+            remote = remote_r.stdout.strip() if remote_r.returncode == 0 else None
+            sha_r = _git(["rev-parse", "HEAD"], cwd=str(root))
+            sha = sha_r.stdout.strip() if sha_r.returncode == 0 else None
+        elif spec.get("url"):
+            remote = spec["url"]
+            root = manifest["cache_root"] / "seeds" / key
+            sha, status = _refresh_clone(remote, root, cache_root=manifest["cache_root"],
+                                         ttl_seconds=ttl, force=args.force)
+            if status != "ok":
+                results[key] = {"status": status}
+                continue
+        else:
+            results[key] = {"status": "skipped (no url or path)"}
+            continue
+        scan = _scan_seed_source(key, spec, root, remote, sha, captured)
+        results[key] = {
+            "status": "ok", "head_sha": sha, "audience": spec.get("audience"),
+            "domain": spec.get("domain", "shared"),
+            "covered_at_repo_level": bool(remote) and _norm_source(remote) in captured,
+            **scan,
+        }
+
+    mode = "commit (staging candidates)" if args.commit else "report-only (add --commit to stage candidates)"
+    print(f"prescan: {len(results)} seed source(s); mode: {mode}")
+    for key in sorted(results):
+        r = results[key]
+        label = f" (audience: {r['audience']})" if r.get("audience") else ""
+        print(f"\nsource: {key}{label}")
+        if r.get("status") != "ok":
+            print(f"  {r['status']}")
+            continue
+        if r.get("covered_at_repo_level"):
+            print("  note: the KB already holds a repo-level pointer to this source.")
+        emitted = [c for c in r["candidates"] if not c["captured"]]
+        for cand in emitted[: args.top]:
+            parts = " ".join(f"{k}={v:+d}" for k, v in sorted(cand["score_parts"].items()) if v)
+            print(f"  [{cand['score']:>3}] {cand['relpath']}  ({parts or 'score 0'})")
+        if len(emitted) > args.top:
+            print(f"  ... and {len(emitted) - args.top} more (full list in prescan-report.json with --commit)")
+        c = r["counts"]
+        print(f"  counts: candidates={c['candidates']} already-captured={c['already_captured']} "
+              f"skipped-secret={c['skipped_secret']} skipped-binary={c['skipped_binary']} "
+              f"skipped-glob={c['skipped_glob']}")
+
+    if not args.commit:
+        return 0
+
+    out_root = manifest["manifest_path"].parent / "prescan-out"
+    written = invalid = 0
+    for key in sorted(results):
+        r = results[key]
+        if r.get("status") != "ok":
+            continue
+        sub_dir = out_root / key
+        if sub_dir.exists():  # idempotent per source: a re-run regenerates its staging subdir
+            shutil.rmtree(sub_dir)
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        for cand in r["candidates"]:
+            if cand["captured"]:
+                continue
+            meta = {
+                "schema_version": SCHEMA_VERSION, "id": cand["id"], "title": cand["title"],
+                "domain": r["domain"], "type": "reference", "status": "draft",
+                "owner_gid": args.owner_gid, "owner_name": args.owner_name,
+                "provenance_type": "reference", "source": cand["source"],
+                "confidence": "medium", "verified": "unverified",
+                "tags": ["prescan", key] + ([r["audience"]] if r.get("audience") else []),
+            }
+            text = emit_frontmatter(meta, cand["abstract"] + "\n")
+            errors = validate_entry(*parse_frontmatter(text))
+            if errors:  # belt and braces: a candidate that fails the store gate is reported, never staged
+                invalid += 1
+                print(f"  WARN: candidate {cand['id']} failed validation "
+                      f"({'; '.join(errors)}); not staged.", file=sys.stderr)
+                continue
+            (sub_dir / f"{cand['id']}.md").write_text(text, encoding="utf-8")
+            written += 1
+    report_path = manifest["manifest_path"].parent / "prescan-report.json"
+    report = {"schema_version": SCHEMA_VERSION, "generated_utc": _now_iso(), "sources": results}
+    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(f"\nOK: staged {written} candidate(s) under {out_root}"
+          + (f" ({invalid} failed validation, not staged)" if invalid else "") + ".")
+    print(f"OK: report written to {report_path}")
+    print("Next: review the staged candidates, then land keepers via `kb.py store <file> --into <repo>`.")
+    return 0
+
+
 def _stub(name):
     def _run(args):
         print(f"{name}: not yet implemented (Phase 1b)", file=sys.stderr)
@@ -1444,9 +1817,26 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--config", default="config.toml", help="path to config.toml (used with --commit)")
     sp.set_defaults(func=cmd_feedback)
 
-    for name in ("prescan", "export"):
-        sp = sub.add_parser(name, help=f"{name} (Phase 1b)")
-        sp.set_defaults(func=_stub(name))
+    sp = sub.add_parser("prescan",
+                        help="scan the manifest's seed sources into ranked pointer candidates (secrets-safe)")
+    sp.add_argument("--config", default="config.toml", help="path to config.toml")
+    sp.add_argument("--source", help="limit the scan to one seed source key from the manifest")
+    sp.add_argument("--aggregate",
+                    help="registry-aggregate.json to dedup against (default: <manifest dir>/registry-aggregate.json)")
+    sp.add_argument("--owner-gid", help="owner for staged candidates (required with --commit)")
+    sp.add_argument("--owner-name", help="owner display name for staged candidates (required with --commit)")
+    sp.add_argument("--top", type=int, default=20, help="ranked candidates to print per source (default 20)")
+    sp.add_argument("--max-age", type=int, default=None, metavar="SECONDS",
+                    help="reuse a url seed's clone without re-fetching within this window "
+                         "(default: config [cache].fetch_ttl_seconds, else 0 = always fetch)")
+    sp.add_argument("--force", action="store_true", help="ignore the fetch cache and re-fetch url seeds")
+    sp.add_argument("--commit", action="store_true",
+                    help="stage candidates under <manifest dir>/prescan-out/ and write prescan-report.json; "
+                         "default is report-only")
+    sp.set_defaults(func=cmd_prescan)
+
+    sp = sub.add_parser("export", help="export (Phase 1b)")
+    sp.set_defaults(func=_stub("export"))
 
     return p
 

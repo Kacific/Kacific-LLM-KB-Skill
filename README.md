@@ -30,7 +30,10 @@ kb.py rot              hygiene sweep for redundant, outdated, or trivial nuggets
 kb.py cache            inspect or clear the local, gitignored TTL lookup cache
 kb.py feedback         append a usage/rating/miss record, or report gap/ROT/conflict findings (--commit
                        reconciles them into the tracking project's KB Findings section)
-kb.py sync|prescan|export   (Phase 1b and operations)
+kb.py sync             drift-detect the managed repos against the recorded aggregate
+kb.py prescan          scan the manifest's seed sources into ranked pointer candidates (--commit stages
+                       them for review; keepers land via the normal store gate)
+kb.py export           (Phase 1b)
 ```
 
 Stdlib-first Python. Copy `config.example.toml` to `config.toml` (gitignored) and fill in the locations for

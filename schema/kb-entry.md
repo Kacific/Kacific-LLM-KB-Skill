@@ -40,6 +40,18 @@ A nugget is only valid if it carries EITHER:
 An entry with neither is refused at store time, not written. The manager never originates its own unsourced
 facts.
 
+## Pointer entries
+
+A pointer entry indexes a document whose single source of truth lives elsewhere. It is a normal nugget
+through the same gate: `provenance_type: reference` with `source` set to the document's URL or path,
+pinned to the source repo's HEAD at scan time where derivable (a GitHub blob URL). The body is a one-line
+abstract only; a pointer never copies source content.
+
+`kb.py prescan` generates pointer candidates in bulk from the manifest's seed sources. Candidates are
+`status: draft` with the reviewing human as owner, and they enter the KB only through the normal
+`store --into` gate after review. A repo-root pointer records that a repo is covered at repo level; it does
+not preclude finer per-file pointers into the same repo.
+
 ## Ownership
 
 `owner_gid` is a real, routable identity (an active user in the tracking workspace), not free text, so the

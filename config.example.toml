@@ -32,6 +32,10 @@ expires_at = "<YYYY-MM-DD>"   # tracked; warn 7 days before expiry
 
 [repos]
 # The private control home holds the authoritative repos.toml manifest. This template only points at it.
+# Besides [managed] and [audiences], the manifest may carry [seed_sources.<key>] tables for `kb.py prescan`
+# (one per source repo): url = "<clone-url>" OR path = "<existing-local-clone>", plus optional
+# kind = "pointer" (the default and only kind), domain, audience, and include/exclude glob lists
+# (include defaults to ["**/*.md"]).
 manifest = "<path-to-private-repos.toml>"
 # Clone cache for manifest-driven `index --manifest` and `sync`: the tool clones and fetches each managed
 # repo here. Optional; defaults to <manifest dir>/cache/repos (gitignored in the control home).
