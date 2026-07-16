@@ -12,7 +12,7 @@ Subcommands:
   sync      git-fetch each managed repo, diff SHA and per-nugget body hash, report drift (1b)
   prescan   one-time extraction of existing repos and KBs to seed the registry (secrets-safe)
   export    render a neutral bundle (Markdown/HTML) for an export target (1b)
-  feedback  append a usage/rating/miss record; optionally raise a tracking task (1b)
+  feedback  append a usage/rating/miss record, or report gap/ROT/conflict findings as a raise plan (1b)
   cache     inspect or clear the local, gitignored TTL lookup cache (git-fetch reuse; Asana lookups later)
 
 Run one-off by hand, or schedule sync/rot/index on the NUC via the existing cron house pattern.
@@ -545,11 +545,12 @@ def cmd_answer(args) -> int:
     return 0
 
 
-def cmd_rot(args) -> int:
-    root = Path(args.repo)
-    nuggets = _load_nuggets(root)
-    now = datetime.now(timezone.utc)
+def _rot_flags(nuggets: list[dict], now: datetime) -> list[dict]:
+    """Compute the Redundant / Outdated / Trivial flags for a nugget set. The single source of the ROT rules.
 
+    Both `rot` (which reports them, grouped by owner) and `feedback` (which turns them into audit-family
+    findings) call this, so the flag rules live in exactly one place. Each flag is {id, path, owner, reasons}.
+    """
     by_id: dict = {}
     by_source: dict = {}
     superseded: set = set()
@@ -586,6 +587,12 @@ def cmd_rot(args) -> int:
                 "owner": m.get("owner_name") or m.get("owner_gid") or "(unassigned)",
                 "reasons": reasons,
             })
+    return flags
+
+
+def cmd_rot(args) -> int:
+    nuggets = _load_nuggets(Path(args.repo))
+    flags = _rot_flags(nuggets, datetime.now(timezone.utc))
 
     if not flags:
         print(f"rot: clean. {len(nuggets)} nuggets, none flagged.")
@@ -601,7 +608,7 @@ def cmd_rot(args) -> int:
         for f in sorted(by_owner[owner], key=lambda x: x["id"]):
             print(f"  - {f['id']} ({f['path']}): {'; '.join(f['reasons'])}")
         print()
-    # Phase 1b raises these as Asana tasks per the audit-family contract; 1a only reports.
+    # Phase 1b `feedback` raises these as Asana tasks per the audit-family contract; `rot` only reports.
     return 0
 
 
@@ -727,6 +734,162 @@ def cmd_cache(args) -> int:
     return 0
 
 
+# --- feedback: logged + swept signals -> audit-family findings --------------
+# Owned finding-id prefixes (this tool's, per the audit-family [<id>] ownership rule; never another tool's).
+_GAP_ID = "KB-GAP"
+_CONFLICT_ID = "KB-CONFLICT"
+_ROT_IDS = {"Outdated": "KB-ROT-OUTDATED", "Redundant": "KB-ROT-REDUNDANT", "Trivial": "KB-ROT-TRIVIAL"}
+_TRIAGE = "(triage)"
+
+
+def _normalise_query(q) -> str:
+    """Lowercase + collapse whitespace, so the same miss upserts one finding, not many. Stays readable."""
+    return " ".join(str(q).lower().split())
+
+
+def _read_interaction_log(log_path: Path) -> tuple[list[dict], bool]:
+    """Return (records, collected). collected is False when the surface could not be read.
+
+    A missing or unreadable log is 'not collected' (the active-family gate), never 'collected, empty': a
+    future clear-leg must not treat absence of a log as proof that every gap task is resolved. An existing but
+    empty log IS collected (zero records). A single malformed line is skipped, not fatal.
+    """
+    if not log_path.exists():
+        return [], False
+    try:
+        text = log_path.read_text(encoding="utf-8")
+    except OSError:
+        return [], False
+    records: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return records, True
+
+
+def _gap_conflict_findings(records: list[dict]) -> list[dict]:
+    """Aggregate the interaction log into gap and conflict findings with stable, deterministic keys."""
+    gaps: dict = {}       # normalised query -> count
+    conflicts: dict = {}  # sorted-id key -> {count, query, ids}
+    for r in records:
+        if r.get("kind") == "gap" or r.get("hit") is False:
+            nq = _normalise_query(r.get("query", ""))
+            if nq:
+                gaps[nq] = gaps.get(nq, 0) + 1
+        if r.get("conflict") is True:
+            ids = sorted(str(i) for i in _as_list(r.get("cited")))
+            if len(ids) > 1:
+                slot = conflicts.setdefault("|".join(ids), {"count": 0, "query": r.get("query", ""), "ids": ids})
+                slot["count"] += 1
+
+    findings: list[dict] = []
+    for nq, count in sorted(gaps.items()):
+        findings.append({
+            "finding_id": _GAP_ID, "key": f"{_GAP_ID}:{nq}", "entity": _TRIAGE,
+            "detail": f"{count} miss(es) logged, no matching nugget",
+        })
+    for joined, slot in sorted(conflicts.items()):
+        findings.append({
+            "finding_id": _CONFLICT_ID, "key": f"{_CONFLICT_ID}:{joined}", "entity": _TRIAGE,
+            "detail": f"{slot['count']} logged tie(s) for query '{_normalise_query(slot['query'])}'; "
+                      f"cited {', '.join(slot['ids'])}",
+        })
+    return findings
+
+
+def _rot_findings(flags: list[dict]) -> list[dict]:
+    """Turn ROT flags into findings, one per (nugget, reason-category), deduped by stable key."""
+    by_key: dict = {}
+    for f in flags:
+        for reason in f["reasons"]:
+            fid = _ROT_IDS.get(reason.split()[0])  # "Outdated"/"Redundant"/"Trivial"
+            if not fid:
+                continue
+            key = f"{fid}:{f['id']}"
+            slot = by_key.setdefault(key, {"finding_id": fid, "entity": f["owner"], "details": []})
+            slot["details"].append(reason)
+    return [
+        {"finding_id": s["finding_id"], "key": k, "entity": s["entity"], "detail": "; ".join(s["details"])}
+        for k, s in sorted(by_key.items())
+    ]
+
+
+def cmd_feedback(args) -> int:
+    """Append a signal record, or report logged + swept signals as an audit-family raise plan (Asana deferred).
+
+    `--log` appends one usage/rating/miss record to the interaction log. The default collects the gap +
+    conflict signals from that log and the ROT flags from an optional repo sweep, computes the finding set
+    (owned KB-* ids, stable keys, grouped by entity), and prints the dry-run raise plan. The Asana read +
+    upsert leg is a deferred follow-up gated on the tracking PAT location in config; nothing is written here.
+    """
+    log_path = Path(args.log_file)
+
+    if args.log:
+        if not args.query:
+            print("feedback --log: --query is required.", file=sys.stderr)
+            return 2
+        kind = args.kind or "gap"
+        record: dict = {"query": args.query, "kind": kind}
+        if kind in {"gap", "miss"}:  # a miss is a gap signal for the aggregator
+            record["kind"] = "gap"
+            record["hit"] = False
+        if args.rating:
+            record["rating"] = args.rating
+        if args.nugget:
+            record["nugget"] = args.nugget
+        _log_interaction(record, str(log_path))
+        print(f"feedback: appended a '{record['kind']}' record for '{args.query}' to {log_path}.")
+        return 0
+
+    notes: list[str] = []
+    findings: list[dict] = []
+
+    records, log_collected = _read_interaction_log(log_path)
+    if log_collected:
+        findings.extend(_gap_conflict_findings(records))
+    else:
+        notes.append(f"gap+conflict family skipped (log not collected: {log_path})")
+
+    if args.repo:
+        nuggets = _load_nuggets(Path(args.repo))
+        findings.extend(_rot_findings(_rot_flags(nuggets, datetime.now(timezone.utc))))
+    else:
+        notes.append("ROT family skipped (no --repo swept)")
+
+    if not findings:
+        line = "feedback: no findings."
+        if notes:
+            line += " " + " ".join(f"[{n}]" for n in notes)
+        print(line)
+        return 0
+
+    # Group-by-entity final sort (owner for ROT; (triage) for gaps + conflicts). No-op when already ordered.
+    by_entity: dict = {}
+    for f in findings:
+        by_entity.setdefault(f["entity"], []).append(f)
+    n_ent = len(by_entity)
+    print(f"feedback: {len(findings)} finding(s) across {n_ent} "
+          f"{'entity' if n_ent == 1 else 'entities'} "
+          f"(dry-run; the Asana raise leg is deferred, it needs the tracking PAT location in config).\n")
+    for entity in sorted(by_entity):
+        print(f"entity: {entity}")
+        for f in sorted(by_entity[entity], key=lambda x: x["key"]):
+            print(f"  - [{f['finding_id']}] {f['key']}")
+            print(f"      {f['detail']}")
+        print()
+    if notes:
+        print("notes (a surface not collected is left as-is, never auto-cleared):")
+        for n in notes:
+            print(f"  - {n}")
+        print()
+    return 0
+
+
 def _stub(name):
     def _run(args):
         print(f"{name}: not yet implemented (Phase 1b)", file=sys.stderr)
@@ -783,7 +946,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--namespace", help="limit --clear to one namespace (e.g. git_fetch)")
     sp.set_defaults(func=cmd_cache)
 
-    for name in ("prescan", "export", "feedback"):
+    sp = sub.add_parser("feedback",
+                        help="append a usage/rating/miss record, or report gap/ROT/conflict findings to raise")
+    sp.add_argument("--repo", help="KB repo root to sweep for ROT findings (omit to skip the ROT family)")
+    sp.add_argument("--log-file", default="logs/interactions.jsonl",
+                    help="interaction log to read gap/conflict signals from (default: logs/interactions.jsonl)")
+    sp.add_argument("--log", action="store_true",
+                    help="append one usage/rating/miss record instead of reporting (needs --query)")
+    sp.add_argument("--kind", choices=["gap", "miss", "rating"], help="record kind for --log (default: gap)")
+    sp.add_argument("--query", help="the query text for --log")
+    sp.add_argument("--nugget", help="nugget id the --log record refers to (optional)")
+    sp.add_argument("--rating", choices=["helpful", "unhelpful"], help="rating for a --log --kind rating record")
+    sp.set_defaults(func=cmd_feedback)
+
+    for name in ("prescan", "export"):
         sp = sub.add_parser(name, help=f"{name} (Phase 1b)")
         sp.set_defaults(func=_stub(name))
 
