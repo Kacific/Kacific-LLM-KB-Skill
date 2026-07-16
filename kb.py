@@ -344,6 +344,38 @@ def _registry_entry(n: dict) -> dict:
     }
 
 
+def _registry_markdown(name: str, generated_utc: str, entries: list) -> str:
+    """Render the human-readable registry.md mirror of a data repo's registry.json.
+
+    Same shape as the mirrors seeded in the data repos: title, the do-not-edit paragraph, the generated
+    stamp, then a table of id | title | domain | type | status | verified sorted by id ("No entries yet."
+    when the repo is empty). The verified column carries the nugget's last_verified date.
+    """
+    lines = [
+        f"# Registry: {name}",
+        "",
+        "Human-readable mirror of `registry.json`, the audience-scoped SSOT registry slice for this repo. The KB",
+        "manager regenerates both (`kb.py index`). Do not edit by hand.",
+        "",
+        f"Generated (UTC): {generated_utc}",
+        "",
+    ]
+    if not entries:
+        lines.append("No entries yet.")
+        return "\n".join(lines) + "\n"
+
+    def cell(value) -> str:
+        return str(value or "").replace("|", "\\|")
+
+    lines.append("| id | title | domain | type | status | verified |")
+    lines.append("|---|---|---|---|---|---|")
+    for e in sorted(entries, key=lambda e: e["id"]):
+        row = (e.get("id"), e.get("title"), e.get("domain"), e.get("type"),
+               e.get("status"), e.get("last_verified"))
+        lines.append("| " + " | ".join(cell(v) for v in row) + " |")
+    return "\n".join(lines) + "\n"
+
+
 def build_aggregate(manifest: dict, *, ttl_seconds: int = 0, force: bool = False) -> dict:
     """Walk every managed repo's refreshed clone and build the full cross-audience aggregate registry.
 
@@ -467,9 +499,18 @@ def cmd_index(args) -> int:
     out = {"schema_version": SCHEMA_VERSION, "generated_utc": _now_iso(), "entries": entries}
     payload = json.dumps(out, indent=2)
     if args.out:
-        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.out).write_text(payload + "\n", encoding="utf-8")
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(payload + "\n", encoding="utf-8")
         print(f"OK: wrote {len(entries)} entries to {args.out}")
+        if out_path.suffix == ".json":
+            # The data repos carry a human mirror next to the JSON registry; regenerate it in the same
+            # pass so the two never drift. The audience label is the last hyphen-separated segment of
+            # the repo directory name (Kacific-LLM-KB-Info-AllStaff -> AllStaff).
+            name = root.resolve().name.rsplit("-", 1)[-1]
+            mirror = out_path.with_name("registry.md")
+            mirror.write_text(_registry_markdown(name, out["generated_utc"], entries), encoding="utf-8")
+            print(f"OK: wrote human mirror to {mirror}")
     else:
         print(payload)
     return 0
