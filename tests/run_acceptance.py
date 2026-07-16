@@ -587,6 +587,32 @@ def emit_frontmatter_round_trips():
     return ok, f"same_meta={same_meta} body_ok={body2 == body} errors={errors}"
 
 
+@check
+def prescan_secret_names_skip_by_name():
+    flagged = ["config.py", "CONFIG.TOML", "config.ini", ".env", ".envrc", "server.pem",
+               "id_rsa", "id_rsa.pub", "api-credentials.json", "deploy-secrets.md", "private.key"]
+    readable = ["notes.md", "config.example.toml", "config.py.sample", "monkey.md", "keyboard-map.md"]
+    bad = [n for n in flagged if not kb._is_secret_name(n)]
+    good = [n for n in readable if kb._is_secret_name(n)]
+    return not bad and not good, f"missed={bad} overblocked={good}"
+
+
+@check
+def prescan_source_url_and_dedup_norm():
+    sha_a, sha_b = "a" * 40, "b" * 40
+    https = kb._seed_source_url("https://github.com/example/repo.git", sha_a, "docs/guide.md")
+    ssh = kb._seed_source_url("git@github.com:example/repo.git", sha_a, "docs/guide.md")
+    blob = f"https://github.com/example/repo/blob/{sha_a}/docs/guide.md"
+    plain = kb._seed_source_url("file:///tmp/seed.git", sha_a, "docs/guide.md")
+    bare = kb._seed_source_url(None, None, "docs/guide.md")
+    forms = https == blob and ssh == blob and plain == "file:///tmp/seed/docs/guide.md" and bare == "docs/guide.md"
+    # Dedup normalisation: the pinned ref is ignored, repo roots match across https/ssh, file != root.
+    ref_free = kb._norm_source(blob) == kb._norm_source(blob.replace(sha_a, sha_b))
+    roots = kb._norm_source("https://github.com/example/repo.git") == kb._norm_source("git@github.com:example/repo.git")
+    distinct = kb._norm_source(blob) != kb._norm_source("https://github.com/example/repo.git")
+    return forms and ref_free and roots and distinct, f"forms={forms} ref_free={ref_free} roots={roots} distinct={distinct}"
+
+
 def main() -> int:
     failures = 0
     for fn in CHECKS:
