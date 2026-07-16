@@ -138,6 +138,39 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
     return meta, body
 
 
+_FM_FIELD_ORDER = [
+    "schema_version", "id", "title", "domain", "type", "status", "owner_gid", "owner_name",
+    "provenance_type", "source", "attested_by", "attested_on", "confidence", "verified",
+    "supersedes", "related", "tags",
+]
+
+
+def emit_frontmatter(meta: dict, body: str) -> str:
+    """Serialise a flat meta dict plus body into the nugget file format parse_frontmatter reads back.
+
+    The inverse of parse_frontmatter for the controlled schema: known fields in schema order, unknown
+    fields after them sorted, inline [a, b] lists, None as null. Values are collapsed to one line and
+    quoted when they would otherwise misparse (leading bracket or quote). Round-trip contract: parsing
+    the output yields the same meta (scalars normalised to strings) and the same body.
+    """
+    def fmt(value) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, list):
+            return "[" + ", ".join(" ".join(str(v).replace(",", " ").split()) for v in value) + "]"
+        s = " ".join(str(value).split())
+        if not s:
+            return "null"
+        if s[0] in "[\"'" or s[-1] in "]\"'":
+            s = '"' + s.strip('"').strip("'") + '"'
+        return s
+
+    keys = [k for k in _FM_FIELD_ORDER if k in meta]
+    keys += sorted(k for k in meta if k not in _FM_FIELD_ORDER)
+    lines = ["---"] + [f"{k}: {fmt(meta[k])}" for k in keys] + ["---", ""]
+    return "\n".join(lines) + body
+
+
 def _as_list(value) -> list:
     if not value:
         return []

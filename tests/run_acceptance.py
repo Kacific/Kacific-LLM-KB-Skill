@@ -568,6 +568,25 @@ def finding_title_roundtrip_and_isolation():
     return (rt and foreign and over), f"rt={rt} foreign={foreign} over={over} biglen={len(bigtitle)}"
 
 
+@check
+def emit_frontmatter_round_trips():
+    meta = {
+        "schema_version": "1", "id": "round-trip-note", "title": "A [bracketed] title: with a colon",
+        "domain": "shared", "type": "reference", "status": "draft",
+        "owner_gid": "0000000000000000", "owner_name": "Example Owner",
+        "provenance_type": "reference", "source": "https://example.invalid/doc.md",
+        "confidence": "medium", "verified": "unverified", "tags": ["prescan", "example"],
+        "zz_custom": None,
+    }
+    body = "A round-trip body comfortably longer than the trivial threshold, kept on one paragraph.\n"
+    text = kb.emit_frontmatter(meta, body)
+    meta2, body2 = kb.parse_frontmatter(text)
+    same_meta = all(meta2.get(k) == v for k, v in meta.items())
+    errors = kb.validate_entry(meta2, body2)
+    ok = same_meta and body2 == body and not errors
+    return ok, f"same_meta={same_meta} body_ok={body2 == body} errors={errors}"
+
+
 def main() -> int:
     failures = 0
     for fn in CHECKS:
