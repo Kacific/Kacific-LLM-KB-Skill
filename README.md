@@ -28,7 +28,8 @@ kb.py index <repo>     rebuild the registry from a repo
 kb.py answer <query>   answer from stored nuggets only, with grounding and citation
 kb.py rot              hygiene sweep for redundant, outdated, or trivial nuggets
 kb.py cache            inspect or clear the local, gitignored TTL lookup cache
-kb.py sync|prescan|export|feedback   (Phase 1b and operations)
+kb.py feedback         append a usage/rating/miss record, or report gap/ROT/conflict findings to raise
+kb.py sync|prescan|export   (Phase 1b and operations)
 ```
 
 Stdlib-first Python. Copy `config.example.toml` to `config.toml` (gitignored) and fill in the locations for

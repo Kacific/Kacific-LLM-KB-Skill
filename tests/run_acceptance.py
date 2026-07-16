@@ -225,6 +225,78 @@ def cache_primitive_ttl():
     return ok, f"fresh={hit_fresh} zero_miss={not miss_zero} stale_miss={not hit_stale} corrupt_miss={not hit_corrupt}"
 
 
+@check
+def feedback_findings_from_log_and_sweep():
+    # A synthetic log (two mixed-case gap misses, one other gap, one conflict) plus a sweep of the fixture KB
+    # (known Outdated/Redundant nuggets) must yield the right findings with stable keys and [<id>] tags.
+    with tempfile.TemporaryDirectory() as d:
+        log = Path(d) / "interactions.jsonl"
+        log.write_text("\n".join([
+            json.dumps({"query": "reset the VPN", "hit": False, "kind": "gap"}),
+            json.dumps({"query": "reset the vpn", "hit": False, "kind": "gap"}),
+            json.dumps({"query": "capital of france", "hit": False, "kind": "gap"}),
+            json.dumps({"query": "vpn thing", "hit": True, "cited": ["b-id", "a-id"], "conflict": True}),
+        ]) + "\n", encoding="utf-8")
+        p = run("feedback", "--repo", str(FIXTURE_KB), "--log-file", str(log))
+    out = p.stdout
+    ok = (
+        p.returncode == 0
+        and "KB-GAP:reset the vpn" in out           # the two mixed-case misses collapse to one stable key
+        and "KB-GAP:capital of france" in out
+        and "KB-CONFLICT:a-id|b-id" in out           # cited ids sorted into a deterministic key
+        and "[KB-GAP]" in out and "[KB-CONFLICT]" in out
+        and "KB-ROT-" in out and "it-password-rotation-standard" in out
+        and "entity: (triage)" in out
+    )
+    return ok, f"rc={p.returncode} out={out.strip()[:200]!r}"
+
+
+@check
+def feedback_active_family_gate():
+    # A non-existent log and no --repo: both families are 'skipped' (not silently empty), and no findings.
+    with tempfile.TemporaryDirectory() as d:
+        p = run("feedback", "--log-file", str(Path(d) / "nope.jsonl"))
+    out = p.stdout
+    ok = (
+        p.returncode == 0 and "no findings" in out
+        and "gap+conflict family skipped" in out and "ROT family skipped" in out
+    )
+    return ok, f"rc={p.returncode} out={out.strip()!r}"
+
+
+@check
+def feedback_log_append():
+    # --log appends a well-formed UTC-stamped record; a second append never overwrites the first.
+    with tempfile.TemporaryDirectory() as d:
+        log = Path(d) / "interactions.jsonl"
+        p1 = run("feedback", "--log", "--kind", "rating", "--query", "reset vpn",
+                 "--rating", "helpful", "--nugget", "shared-vpn-reset", "--log-file", str(log))
+        p2 = run("feedback", "--log", "--kind", "miss", "--query", "capital of france", "--log-file", str(log))
+        recs = [json.loads(l) for l in log.read_text(encoding="utf-8").splitlines() if l.strip()]
+    ok = (
+        p1.returncode == 0 and p2.returncode == 0 and len(recs) == 2
+        and recs[0].get("rating") == "helpful" and recs[0].get("ts")
+        and recs[1].get("hit") is False and recs[1].get("kind") == "gap"
+    )
+    return ok, f"rc1={p1.returncode} rc2={p2.returncode} n={len(recs)}"
+
+
+@check
+def feedback_steady_state():
+    # An existing-but-empty log (collected, zero records) + a clean repo -> no findings, no skip notes.
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with tempfile.TemporaryDirectory() as d:
+        log = Path(d) / "interactions.jsonl"
+        log.write_text("", encoding="utf-8")  # exists but empty: collected, not skipped
+        repo = Path(d) / "kb"
+        _write(repo / "shared" / "fresh.md",
+               _nugget(id="shared-fresh-note", title="Fresh note", verified=today, attested_on=today))
+        p = run("feedback", "--repo", str(repo), "--log-file", str(log))
+    out = p.stdout
+    ok = p.returncode == 0 and "no findings" in out and "skipped" not in out
+    return ok, f"rc={p.returncode} out={out.strip()!r}"
+
+
 def main() -> int:
     failures = 0
     for fn in CHECKS:

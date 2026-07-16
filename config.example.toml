@@ -3,6 +3,9 @@
 
 [tracking]
 # The task-tracking workspace and portfolio (real GIDs live in the private control home, not here).
+# `kb.py feedback` currently computes and reports the raise plan only (gap / ROT / conflict findings). The
+# Asana read + upsert leg, which consumes the PAT below, is a deferred follow-up, so these values and the
+# PAT are not read yet.
 workspace_gid = "<workspace-gid>"
 portfolio_gid = "<portfolio-gid>"
 project_gid = "<ai-tracking-project-gid>"
