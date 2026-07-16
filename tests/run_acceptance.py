@@ -147,6 +147,44 @@ def index_emits_registry():
 
 
 @check
+def index_out_json_writes_md_mirror():
+    # --out to a .json path must also regenerate the sibling registry.md human mirror: header, do-not-edit
+    # paragraph, generated stamp, and the id|title|domain|type|status|verified table sorted by id.
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "registry.json"
+        p = run("index", str(FIXTURE_KB), "--out", str(out))
+        mirror = out.with_name("registry.md")
+        if p.returncode != 0 or not out.exists() or not mirror.exists():
+            return False, f"rc={p.returncode} json={out.exists()} md={mirror.exists()} stderr={p.stderr.strip()!r}"
+        entries = json.loads(out.read_text(encoding="utf-8"))["entries"]
+        text = mirror.read_text(encoding="utf-8")
+    ids = sorted(e["id"] for e in entries)
+    rows_in_order = all(
+        text.index(f"| {a} |") < text.index(f"| {b} |") for a, b in zip(ids, ids[1:])
+    ) if all(f"| {i} |" in text for i in ids) else False
+    ok = (
+        text.startswith("# Registry: ")
+        and "Do not edit by hand." in text
+        and "Generated (UTC): " in text
+        and "| id | title | domain | type | status | verified |" in text
+        and rows_in_order
+    )
+    return ok, f"n={len(entries)} rows_in_order={rows_in_order}"
+
+
+@check
+def index_out_non_json_skips_md_mirror():
+    # A non-.json --out (someone redirecting the payload elsewhere) must not spray a registry.md next to it.
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "registry.txt"
+        p = run("index", str(FIXTURE_KB), "--out", str(out))
+        out_exists = out.exists()
+        mirror_exists = (Path(d) / "registry.md").exists()
+    ok = p.returncode == 0 and out_exists and not mirror_exists
+    return ok, f"rc={p.returncode} out_exists={out_exists} mirror_exists={mirror_exists}"
+
+
+@check
 def answer_hit_cites_source():
     p = run("answer", "reset the vpn client", "--repo", str(FIXTURE_KB), "--no-log")
     ok = p.returncode == 0 and "[Source:" in p.stdout and "shared-vpn-reset" in p.stdout
