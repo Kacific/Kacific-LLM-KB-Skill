@@ -297,6 +297,239 @@ def feedback_steady_state():
     return ok, f"rc={p.returncode} out={out.strip()!r}"
 
 
+# --- Asana reconcile leg (in-process, with a fake client) -------------------
+#
+# Live Asana writes cannot be unit-tested, so `_reconcile` is driven in-process against a dict-backed fake
+# that records every POST/PUT and serves canned reads. The live-only checks (a real --commit into the KB
+# Findings section, the steady-state no-op second run, reopen on a human-closed task, the Verification attach)
+# are documented in tests/README.md and run on the NUC with a real [tracking.pat]; they are not in this
+# offline harness.
+
+class FakeAsanaClient:
+    """Dict-backed stand-in for kb._AsanaClient. Reads return canned fixtures; every mutating call is recorded
+    in .writes as (method, path, body) so a check can assert exactly what was (or was not) written."""
+
+    def __init__(self, sections=None, tasks=None, fields=None, settings=None):
+        self._sections = [dict(s) for s in (sections or [])]
+        self._tasks = [dict(t) for t in (tasks or [])]
+        self._fields = [dict(f) for f in (fields or [])]
+        self._settings = [dict(s) for s in (settings or [])]
+        self.writes = []
+        self._counter = 900000
+
+    def _mint(self):
+        self._counter += 1
+        return str(self._counter)
+
+    def get_all(self, path, params=None):
+        if path.startswith("/projects/") and path.endswith("/sections"):
+            return [dict(s) for s in self._sections]
+        if "custom_field_settings" in path:
+            return [dict(s) for s in self._settings]
+        if "custom_fields" in path:
+            return [dict(f) for f in self._fields]
+        if path.startswith("/sections/") and path.endswith("/tasks"):
+            return [dict(t) for t in self._tasks]
+        return []
+
+    def get(self, path, params=None):
+        return {"data": {}}
+
+    def post(self, path, body):
+        self.writes.append(("POST", path, dict(body)))
+        if path.startswith("/projects/") and path.endswith("/sections"):
+            gid = self._mint()
+            self._sections.append({"gid": gid, "name": body.get("name")})
+            return {"data": {"gid": gid}}
+        if path == "/tasks":
+            gid = self._mint()
+            self._tasks.append({"gid": gid, "name": body.get("name"), "completed": False})
+            return {"data": {"gid": gid}}
+        return {"data": {"gid": None}}
+
+    def put(self, path, body):
+        self.writes.append(("PUT", path, dict(body)))
+        if path.startswith("/tasks/") and "completed" in body:
+            gid = path.split("/")[2]
+            for t in self._tasks:
+                if t.get("gid") == gid:
+                    t["completed"] = body["completed"]
+        return {"data": {}}
+
+
+def _finding(fid, subject, entity="(triage)", owner_gid=None, detail="detail"):
+    return {"finding_id": fid, "key": f"{fid}:{subject}", "entity": entity,
+            "owner_gid": owner_gid, "detail": detail}
+
+
+def _cfg(**tracking):
+    base = {"project_gid": "PROJ", "workspace_gid": "WS", "section_name": "KB Findings",
+            "verification_field": "Verification", "default_assignee": "DA"}
+    base.update(tracking)
+    return {"tracking": {**base, "pat": {"token": "unused-by-reconcile"}}}
+
+
+_KB_SECTION = [{"gid": "SEC", "name": "KB Findings"}]
+_ALL_ACTIVE = {"KB-GAP", "KB-CONFLICT", "KB-ROT-OUTDATED", "KB-ROT-REDUNDANT", "KB-ROT-TRIVIAL"}
+
+
+@check
+def reconcile_create_assigns_and_files_to_section():
+    fake = FakeAsanaClient(sections=list(_KB_SECTION))
+    findings = [_finding("KB-ROT-OUTDATED", "nug-1", entity="Owner A", owner_gid="111"),
+                _finding("KB-GAP", "reset vpn")]
+    counts = kb._reconcile(fake, _cfg(), findings, set(_ALL_ACTIVE), True)
+    creates = [w for w in fake.writes if w[0] == "POST" and w[1] == "/tasks"]
+    rot = next((w for w in creates if w[2]["name"].startswith("[KB-ROT-OUTDATED]")), None)
+    gap = next((w for w in creates if w[2]["name"].startswith("[KB-GAP]")), None)
+    ok = (counts["created"] == 2 and counts["failed"] == 0
+          and rot is not None and rot[2].get("assignee") == "111"      # ROT -> the nugget owner
+          and gap is not None and gap[2].get("assignee") == "DA"       # triage -> the default assignee
+          and any(w[1].endswith("/addTask") for w in fake.writes))
+    return ok, f"counts={counts}"
+
+
+@check
+def reconcile_noop_when_open_task_matches():
+    title = kb._finding_title(_finding("KB-GAP", "reset vpn"))
+    fake = FakeAsanaClient(sections=list(_KB_SECTION),
+                           tasks=[{"gid": "T1", "name": title, "completed": False}])
+    counts = kb._reconcile(fake, _cfg(), [_finding("KB-GAP", "reset vpn")], {"KB-GAP", "KB-CONFLICT"}, True)
+    ok = counts["noop"] == 1 and counts["created"] == 0 and fake.writes == []
+    return ok, f"counts={counts} writes={fake.writes}"
+
+
+@check
+def reconcile_verify_clears_absent_finding():
+    title = kb._finding_title(_finding("KB-GAP", "old query"))
+    fake = FakeAsanaClient(sections=list(_KB_SECTION),
+                           tasks=[{"gid": "T9", "name": title, "completed": False}])
+    counts = kb._reconcile(fake, _cfg(), [], {"KB-GAP", "KB-CONFLICT"}, True)
+    puts = [w for w in fake.writes if w[0] == "PUT" and w[1] == "/tasks/T9"]
+    ok = counts["verify_cleared"] == 1 and any(w[2].get("completed") is True for w in puts)
+    return ok, f"counts={counts} writes={fake.writes}"
+
+
+@check
+def reconcile_reopens_human_closed_still_present():
+    f = _finding("KB-ROT-REDUNDANT", "dup-nug", entity="Owner A", owner_gid="111")
+    title = kb._finding_title(f)
+    fake = FakeAsanaClient(sections=list(_KB_SECTION),
+                           tasks=[{"gid": "T5", "name": title, "completed": True}])
+    counts = kb._reconcile(fake, _cfg(), [f], {"KB-ROT-REDUNDANT"}, True)
+    puts = [w for w in fake.writes if w[0] == "PUT" and w[1] == "/tasks/T5"]
+    ok = counts["reopened"] == 1 and any(w[2].get("completed") is False for w in puts)
+    return ok, f"counts={counts} writes={fake.writes}"
+
+
+@check
+def reconcile_gate_skips_uncollected_family():
+    # An open ROT task, but ROT was NOT collected this run (only the log families are active). It must be left
+    # exactly as-is, never verify-cleared (the active-family gate).
+    title = kb._finding_title(_finding("KB-ROT-OUTDATED", "nug-x", entity="Owner A"))
+    fake = FakeAsanaClient(sections=list(_KB_SECTION),
+                           tasks=[{"gid": "T7", "name": title, "completed": False}])
+    counts = kb._reconcile(fake, _cfg(), [], {"KB-GAP", "KB-CONFLICT"}, True)
+    touched = [w for w in fake.writes if "/tasks/T7" in w[1]]
+    ok = counts["skipped_inactive"] >= 1 and touched == []
+    return ok, f"counts={counts} writes={fake.writes}"
+
+
+@check
+def reconcile_isolation_ignores_foreign_tasks():
+    kbtitle = kb._finding_title(_finding("KB-GAP", "q"))
+    fake = FakeAsanaClient(
+        sections=list(_KB_SECTION),
+        tasks=[{"gid": "B1", "name": "[Build] scaffold", "completed": False},
+               {"gid": "C1", "name": "[Chip] rollout", "completed": False},
+               {"gid": "L1", "name": "[OTHER-TOOL] a sibling audit task", "completed": False},
+               {"gid": "K1", "name": kbtitle, "completed": False}])
+    counts = kb._reconcile(fake, _cfg(), [], {"KB-GAP", "KB-CONFLICT"}, True)
+    foreign = [w for w in fake.writes if any(g in w[1] for g in ("/B1", "/C1", "/L1"))]
+    kb_put = [w for w in fake.writes if w[0] == "PUT" and w[1] == "/tasks/K1"]
+    ok = foreign == [] and counts["verify_cleared"] == 1 and len(kb_put) >= 1
+    return ok, f"counts={counts} writes={fake.writes}"
+
+
+@check
+def reconcile_dry_run_makes_zero_writes():
+    fake = FakeAsanaClient(sections=list(_KB_SECTION))
+    findings = [_finding("KB-GAP", "reset vpn"),
+                _finding("KB-ROT-TRIVIAL", "nug-2", entity="Owner A", owner_gid="111")]
+    counts = kb._reconcile(fake, _cfg(), findings, {"KB-GAP", "KB-CONFLICT", "KB-ROT-TRIVIAL"}, False)
+    ok = counts["created"] == 2 and fake.writes == []
+    return ok, f"counts={counts} writes={fake.writes}"
+
+
+@check
+def reconcile_sets_enum_or_degrades_to_comment():
+    vfields = [{"gid": "VF", "name": "Verification", "resource_subtype": "enum",
+                "enum_options": [{"gid": "o1", "name": "unverified"}]}]
+    settings = [{"custom_field": {"gid": "VF"}}]
+    fake_field = FakeAsanaClient(sections=list(_KB_SECTION), fields=vfields, settings=settings)
+    kb._reconcile(fake_field, _cfg(), [_finding("KB-GAP", "q1")], {"KB-GAP", "KB-CONFLICT"}, True)
+    enum_set = any(w[0] == "PUT" and isinstance(w[2].get("custom_fields"), dict) for w in fake_field.writes)
+    fake_none = FakeAsanaClient(sections=list(_KB_SECTION))
+    kb._reconcile(fake_none, _cfg(), [_finding("KB-GAP", "q2")], {"KB-GAP", "KB-CONFLICT"}, True)
+    commented = any(w[0] == "POST" and w[1].endswith("/stories") for w in fake_none.writes)
+    ok = enum_set and commented
+    return ok, f"enum_set={enum_set} commented={commented}"
+
+
+@check
+def rot_findings_carry_owner_gid():
+    now = datetime.now(timezone.utc)
+    flags = kb._rot_flags(kb._load_nuggets(FIXTURE_KB), now)
+    findings = kb._rot_findings(flags)
+    ok = (bool(flags) and all("owner_gid" in f for f in flags)
+          and bool(findings) and all("owner_gid" in f for f in findings))
+    return ok, f"flags={len(flags)} findings={len(findings)}"
+
+
+@check
+def resolve_tracking_pat_order_and_error():
+    inline = kb._resolve_tracking_pat({"tracking": {"pat": {"token": "INLINE"}}})
+    with tempfile.TemporaryDirectory() as d:
+        sf = Path(d) / "pat"
+        sf.write_text("FILETOKEN\n", encoding="utf-8")
+        fromfile = kb._resolve_tracking_pat({"tracking": {"pat": {"secret_file": str(sf)}}})
+        both = kb._resolve_tracking_pat({"tracking": {"pat": {"token": "INLINE", "secret_file": str(sf)}}})
+    raised = False
+    try:
+        kb._resolve_tracking_pat({"tracking": {"pat": {}}})
+    except SystemExit:
+        raised = True
+    ok = inline == "INLINE" and fromfile == "FILETOKEN" and both == "INLINE" and raised
+    return ok, f"inline={inline!r} file={fromfile!r} both={both!r} raised={raised}"
+
+
+@check
+def asana_client_never_leaks_pat_in_errors():
+    # A failing request must not carry the PAT into the error message (it rides in a header, never the URL).
+    client = kb._AsanaClient("SENTINELTOKEN", base="http://127.0.0.1:9", max_retries=0)
+    msg = ""
+    try:
+        client.get("/users/me")
+    except kb._AsanaError as exc:
+        msg = str(exc)
+    ok = msg != "" and "SENTINELTOKEN" not in msg
+    return ok, f"msg={msg!r}"
+
+
+@check
+def finding_title_roundtrip_and_isolation():
+    cases = [_finding("KB-GAP", "how do i fix [thing] please"),
+             _finding("KB-CONFLICT", "a-id|b-id"),
+             _finding("KB-ROT-OUTDATED", "some-nugget-id")]
+    rt = all(kb._finding_id_from_title(kb._finding_title(f)) == f["finding_id"] for f in cases)
+    foreign = all(kb._finding_id_from_title(t) is None
+                  for t in ("[Build] scaffold", "[Chip] rollout", "[OTHER-TOOL] a sibling task", "plain text"))
+    big = _finding("KB-GAP", "x" * 2000)
+    bigtitle = kb._finding_title(big)
+    over = len(bigtitle) <= kb._ASANA_NAME_MAX and kb._finding_id_from_title(bigtitle) == "KB-GAP"
+    return (rt and foreign and over), f"rt={rt} foreign={foreign} over={over} biglen={len(bigtitle)}"
+
+
 def main() -> int:
     failures = 0
     for fn in CHECKS:
