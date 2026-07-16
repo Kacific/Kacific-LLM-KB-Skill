@@ -28,7 +28,8 @@ kb.py index <repo>     rebuild the registry from a repo
 kb.py answer <query>   answer from stored nuggets only, with grounding and citation
 kb.py rot              hygiene sweep for redundant, outdated, or trivial nuggets
 kb.py cache            inspect or clear the local, gitignored TTL lookup cache
-kb.py feedback         append a usage/rating/miss record, or report gap/ROT/conflict findings to raise
+kb.py feedback         append a usage/rating/miss record, or report gap/ROT/conflict findings (--commit
+                       reconciles them into the tracking project's KB Findings section)
 kb.py sync|prescan|export   (Phase 1b and operations)
 ```
 

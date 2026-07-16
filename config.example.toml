@@ -1,21 +1,33 @@
 # Copy to config.toml (gitignored) and fill in for your deployment.
-# Store credential LOCATIONS only, never the secret values.
+# Store credential LOCATIONS only, never the secret values. The one exception is [tracking.pat].token: an
+# inline PAT value is permitted, but ONLY in the private, gitignored config.toml (never here, never public).
 
 [tracking]
-# The task-tracking workspace and portfolio (real GIDs live in the private control home, not here).
-# `kb.py feedback` currently computes and reports the raise plan only (gap / ROT / conflict findings). The
-# Asana read + upsert leg, which consumes the PAT below, is a deferred follow-up, so these values and the
-# PAT are not read yet.
+# The task-tracking workspace and project (real GIDs live in the private control home, not here).
+# `kb.py feedback --commit` reconciles the finding set (gap / ROT / conflict) into a section of the tracking
+# project via the Asana REST API using the PAT below; without --commit it stays an offline dry-run and reads
+# none of these.
 workspace_gid = "<workspace-gid>"
 portfolio_gid = "<portfolio-gid>"
-project_gid = "<ai-tracking-project-gid>"
+project_gid = "<tracking-project-gid>"
+# The section within the tracking project that KB findings tasks are filed into (find-or-created by name).
+# The tool owns only its own [KB-*] tasks there, so the section may coexist with other tasks.
+section_name = "KB Findings"
+# Optional. Assignee GID for triage findings (gaps/conflicts) and any ROT finding whose nugget has no owner.
+# Leave empty to create those tasks unassigned.
+default_assignee = "<assignee-gid-or-empty>"
+# Optional. Name of the shared workspace-scoped enum field recording verification state (attached to the
+# project if present; if absent, the tool records state as a task comment instead). Empty to always comment.
+verification_field = "Verification"
 
 [tracking.pat]
-# Location of the tracking PAT, resolved at runtime. Never the value.
-# Dev (macOS): a Keychain entry name, read with: security find-generic-password -s <entry> -w
-macos_keychain_entry = "<entry-name>"
-# Prod (NUC/Linux): a root-owned secret file path.
+# Where the tracking PAT is resolved from at runtime, first non-empty wins. Never the value, EXCEPT `token`.
+# Dev (macOS/Linux): an inline PAT VALUE, permitted only in the private gitignored config.toml.
+token = "<inline-pat-value-private-config-only-or-empty>"
+# Prod (NUC/Linux): a root-owned secret file path holding the PAT (read and stripped).
 secret_file = "/root/.secrets/<file>"
+# Dev (macOS) alternative: a Keychain entry name, read with: security find-generic-password -s <entry> -w
+macos_keychain_entry = "<entry-name-or-empty>"
 expires_at = "<YYYY-MM-DD>"   # tracked; warn 7 days before expiry
 
 [repos]

@@ -12,7 +12,8 @@ Subcommands:
   sync      git-fetch each managed repo, diff SHA and per-nugget body hash, report drift (1b)
   prescan   one-time extraction of existing repos and KBs to seed the registry (secrets-safe)
   export    render a neutral bundle (Markdown/HTML) for an export target (1b)
-  feedback  append a usage/rating/miss record, or report gap/ROT/conflict findings as a raise plan (1b)
+  feedback  append a usage/rating/miss record, or report gap/ROT/conflict findings; --commit reconciles
+            them into the tracking project as Asana tasks (create/no-op/verify-clear/reopen) (1b)
   cache     inspect or clear the local, gitignored TTL lookup cache (git-fetch reuse; Asana lookups later)
 
 Run one-off by hand, or schedule sync/rot/index on the NUC via the existing cron house pattern.
@@ -25,6 +26,10 @@ import json
 import re
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -585,6 +590,9 @@ def _rot_flags(nuggets: list[dict], now: datetime) -> list[dict]:
             flags.append({
                 "id": m["id"], "path": str(n["path"]),
                 "owner": m.get("owner_name") or m.get("owner_gid") or "(unassigned)",
+                # owner_gid is carried separately (additive) so `feedback` can assign the Asana task to a real
+                # person; `owner` stays the display string so `cmd_rot` grouping and its tests are unchanged.
+                "owner_gid": m.get("owner_gid"),
                 "reasons": reasons,
             })
     return flags
@@ -741,6 +749,57 @@ _CONFLICT_ID = "KB-CONFLICT"
 _ROT_IDS = {"Outdated": "KB-ROT-OUTDATED", "Redundant": "KB-ROT-REDUNDANT", "Trivial": "KB-ROT-TRIVIAL"}
 _TRIAGE = "(triage)"
 
+# The finding-ids this tool OWNS. In the shared AI Tracking project this set is the whole mutual-exclusion
+# mechanism (kacific-audit-governance): the tool only ever reads, completes, or reopens tasks whose title
+# carries one of these tags, so it never touches a [Build]/[Chip] task or a sibling audit's [<id>] task.
+# Additive-only: adding a new KB finding-id here is safe; renaming or reusing a sibling's prefix is not.
+_OWNED_IDS = (_GAP_ID, _CONFLICT_ID, *_ROT_IDS.values())
+# Anchored, with the tag alternation holding no ']', so `\] ` always closes the tag bracket and group(2) is
+# the exact subject even when the subject itself contains '] ', '|', or spaces.
+_OWNED_RE = re.compile(r"^\[(" + "|".join(re.escape(i) for i in _OWNED_IDS) + r")\] (.+)$")
+_ASANA_NAME_MAX = 1000  # Asana caps task names near 1024; stay under so a title is never silently truncated.
+
+
+def _finding_subject(finding: dict) -> str:
+    """The stable key with its leading '<finding_id>:' stripped, i.e. the human-facing tail of the title."""
+    key, prefix = finding["key"], finding["finding_id"] + ":"
+    return key[len(prefix):] if key.startswith(prefix) else key
+
+
+def _finding_title(finding: dict) -> str:
+    """`[<id>] <subject>`. Title equality IS key equality (exactly one title per finding), so the reconcile
+    keys on the title and never reconstructs the key. A subject long enough to risk Asana truncating the name
+    (which would silently break dedup and re-create the task every run) is shortened deterministically, with a
+    short hash of the full subject appended so two long subjects never collapse to the same title; the full
+    text still goes in the task body."""
+    fid, subject = finding["finding_id"], _finding_subject(finding)
+    title = f"[{fid}] {subject}"
+    if len(title) > _ASANA_NAME_MAX:
+        digest = hashlib.sha1(subject.encode("utf-8")).hexdigest()[:8]
+        keep = max(1, _ASANA_NAME_MAX - len(fid) - 20)  # room for "[id] ", the "… #", and the 8-char digest
+        title = f"[{fid}] {subject[:keep]}… #{digest}"
+    return title
+
+
+def _finding_id_from_title(name: str) -> str | None:
+    """The owned finding-id a task title carries, or None when the title is not one of ours (a [Build]/[Chip]
+    task, or a sibling audit's [<id>]). This is what keeps the tool on its own tasks in the shared project."""
+    m = _OWNED_RE.match(name or "")
+    return m.group(1) if m else None
+
+
+def _active_ids(log_collected: bool, rot_collected: bool) -> set:
+    """The finding-id families whose surface was actually collected this run (the active-family gate). The
+    verify-clear/reopen pass may only act on a task whose id is in this set; a family whose surface was NOT
+    collected is left exactly as-is, never auto-cleared. An uncollected surface simply does not appear here,
+    so the safe default (touch nothing) falls out for free."""
+    active: set = set()
+    if log_collected:
+        active |= {_GAP_ID, _CONFLICT_ID}
+    if rot_collected:
+        active |= set(_ROT_IDS.values())
+    return active
+
 
 def _normalise_query(q) -> str:
     """Lowercase + collapse whitespace, so the same miss upserts one finding, not many. Stays readable."""
@@ -811,12 +870,363 @@ def _rot_findings(flags: list[dict]) -> list[dict]:
             if not fid:
                 continue
             key = f"{fid}:{f['id']}"
-            slot = by_key.setdefault(key, {"finding_id": fid, "entity": f["owner"], "details": []})
+            slot = by_key.setdefault(
+                key, {"finding_id": fid, "entity": f["owner"], "owner_gid": f.get("owner_gid"), "details": []})
             slot["details"].append(reason)
     return [
-        {"finding_id": s["finding_id"], "key": k, "entity": s["entity"], "detail": "; ".join(s["details"])}
+        {"finding_id": s["finding_id"], "key": k, "entity": s["entity"], "owner_gid": s["owner_gid"],
+         "detail": "; ".join(s["details"])}
         for k, s in sorted(by_key.items())
     ]
+
+
+# --- Asana reconcile leg (feedback --commit) --------------------------------
+#
+# This is the KB manager's member of the Kacific audit family (kacific-audit-governance): read-only discovery
+# (done above by the finding set), file to Asana, and let re-discovery be the judge of "done". It files into a
+# section of the SHARED AI Tracking project, so `_OWNED_RE` isolation and section-scoped reads keep it off the
+# [Build]/[Chip] tasks. The verify-clear/reopen pass is guarded by the active-family gate (`_active_ids`).
+#
+# DEFERRED, consciously (not silently dropped): the regression guard (a per-id `check_version` + a history
+# JSON) from the contract. Re-discovery already reopens a human-closed but still-present finding; the guard
+# only covers the narrow "a loosened check closed a task, later tightened" window, and a half-used state file
+# is a premature forward-compat surface. The finding-id constants stay additive-ready for it. Multi-destination
+# routing is also deferred (single destination here; the default-destination shape leaves room to add it).
+
+
+def _retry_after_seconds(header_value, attempt: int) -> float:
+    """Honour Asana's Retry-After (integer seconds) on a 429; fall back to a bounded exponential backoff."""
+    try:
+        return max(1.0, float(header_value))
+    except (TypeError, ValueError):
+        return float(min(2 ** attempt, 30))
+
+
+def _asana_error_message(body: str) -> str:
+    """Pull Asana's errors[].message out of an error body for a readable failure, without dumping the whole
+    payload. Never contains the PAT (it rides in a request header, not the body)."""
+    try:
+        errs = json.loads(body).get("errors", [])
+        return "; ".join(e.get("message", "") for e in errs if e.get("message")) or (body or "")[:200]
+    except (ValueError, AttributeError):
+        return (body or "")[:200]
+
+
+def _resolve_tracking_pat(config: dict) -> str:
+    """Resolve the tracking PAT VALUE from its configured LOCATION. First non-empty wins:
+      1. [tracking.pat].token                inline value (dev; only ever in the private gitignored config)
+      2. [tracking.pat].secret_file          a root-owned file path (the NUC prod location; read + stripped)
+      3. [tracking.pat].macos_keychain_entry a Keychain entry name, read via `security ... -w`
+    Never logs or returns the value to a printing caller; raises SystemExit with a LOCATION-only message (never
+    the value) when none resolve. The Keychain subprocess argv holds only the entry name, and any subprocess
+    error is scrubbed to a fresh message so no argv/trace leaks (feedback_scrub_subprocess_exceptions)."""
+    pat_cfg = (config.get("tracking", {}) or {}).get("pat", {}) or {}
+
+    token = str(pat_cfg.get("token") or "").strip()
+    if token:
+        return token
+
+    secret_file = str(pat_cfg.get("secret_file") or "").strip()
+    if secret_file:
+        p = Path(secret_file).expanduser()
+        if p.exists():
+            value = p.read_text(encoding="utf-8").strip()
+            if value:
+                return value
+
+    entry = str(pat_cfg.get("macos_keychain_entry") or "").strip()
+    if entry:
+        try:
+            proc = subprocess.run(
+                ["security", "find-generic-password", "-s", entry, "-w"],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise SystemExit(f"could not read the tracking PAT from Keychain entry '{entry}'")
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+
+    raise SystemExit(
+        "no tracking PAT resolved: set [tracking.pat].token (dev), .secret_file (NUC prod), or "
+        ".macos_keychain_entry in config.toml. The value is never stored in this repo, only its location."
+    )
+
+
+class _AsanaError(Exception):
+    """An Asana REST call that failed after retries. A normal Exception (not SystemExit) so the reconcile can
+    catch it per-task and carry on (a stale assignee, an unreachable annotation) instead of aborting the run."""
+
+
+class _AsanaClient:
+    """Minimal stdlib-urllib client for the Asana REST API, so the NUC needs no third-party package. The PAT
+    rides in the Authorization header ONLY (never the URL/query, per the privacy rule) and is never logged.
+    urllib raises HTTPError on every non-2xx, so `_request` reads the error body for Asana's message and backs
+    off on 429/5xx."""
+
+    _BASE = "https://app.asana.com/api/1.0"
+
+    def __init__(self, pat: str, *, base: str | None = None, max_retries: int = 6):
+        self._pat = pat
+        self._base = base or self._BASE
+        self._max_retries = max_retries
+
+    def _request(self, method: str, path: str, *, params: dict | None = None, body: dict | None = None):
+        url = self._base + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        data = json.dumps({"data": body}).encode("utf-8") if body is not None else None
+        headers = {"Authorization": f"Bearer {self._pat}", "Accept": "application/json"}
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+
+        attempt = 0
+        while True:
+            req = urllib.request.Request(url, data=data, method=method, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = ""
+                try:
+                    detail = exc.read().decode("utf-8")
+                except Exception:  # noqa: BLE001 - a body we cannot read is not worth failing over
+                    pass
+                if exc.code == 429 and attempt < self._max_retries:
+                    time.sleep(_retry_after_seconds(exc.headers.get("Retry-After"), attempt))
+                    attempt += 1
+                    continue
+                if 500 <= exc.code < 600 and attempt < self._max_retries:
+                    time.sleep(min(2 ** attempt, 30))
+                    attempt += 1
+                    continue
+                raise _AsanaError(f"Asana {method} {path} -> HTTP {exc.code}: {_asana_error_message(detail)}")
+            except urllib.error.URLError as exc:
+                if attempt < self._max_retries:
+                    time.sleep(min(2 ** attempt, 30))
+                    attempt += 1
+                    continue
+                raise _AsanaError(f"Asana {method} {path} -> network error: {exc.reason}")
+
+    def get(self, path: str, params: dict | None = None):
+        return self._request("GET", path, params=params)
+
+    def post(self, path: str, body: dict):
+        return self._request("POST", path, body=body)
+
+    def put(self, path: str, body: dict):
+        return self._request("PUT", path, body=body)
+
+    def get_all(self, path: str, params: dict | None = None) -> list:
+        """Follow Asana offset pagination, returning the concatenated data list."""
+        out: list = []
+        params = dict(params or {})
+        params.setdefault("limit", 100)
+        while True:
+            page = self._request("GET", path, params=params)
+            out.extend(page.get("data", []))
+            offset = (page.get("next_page") or {}).get("offset")
+            if not offset:
+                return out
+            params["offset"] = offset
+
+
+def _ensure_kb_section(client, project_gid: str, section_name: str, commit: bool) -> str | None:
+    """The gid of the KB findings section within the project, find-or-create by name. Dry-run looks up only and
+    returns None when the section does not exist yet (so a dry-run makes zero writes)."""
+    for s in client.get_all(f"/projects/{project_gid}/sections", {"opt_fields": "name"}):
+        if s.get("name") == section_name:
+            return s.get("gid")
+    if not commit:
+        return None
+    created = client.post(f"/projects/{project_gid}/sections", {"name": section_name})
+    return created.get("data", {}).get("gid")
+
+
+def _ensure_verification_field(client, workspace_gid: str, project_gid: str, field_name: str,
+                               commit: bool) -> dict | None:
+    """Find the workspace-scoped enum field `field_name` and ensure it is attached to the project. Returns
+    {"field_gid", "options": {option_name: option_gid}} or None when the field is absent/unusable (callers then
+    degrade to a comment). KB is NOT the owning writer of this shared field (kacific-audit-governance), so it
+    never CREATES the field and never adds enum options; it uses the options the owning audits already defined,
+    and skips any state whose option is absent."""
+    if not workspace_gid:
+        return None
+    field = None
+    for f in client.get_all(f"/workspaces/{workspace_gid}/custom_fields",
+                            {"opt_fields": "name,resource_subtype,enum_options.name"}):
+        if f.get("name") == field_name and f.get("resource_subtype") == "enum":
+            field = f
+            break
+    if not field:
+        return None
+    field_gid = field.get("gid")
+    options = {o.get("name"): o.get("gid") for o in field.get("enum_options", []) if o.get("name")}
+    settings = client.get_all(f"/projects/{project_gid}/custom_field_settings",
+                              {"opt_fields": "custom_field.gid"})
+    attached = any((s.get("custom_field") or {}).get("gid") == field_gid for s in settings)
+    if not attached:
+        if not commit:
+            return {"field_gid": field_gid, "options": options}
+        try:
+            client.post(f"/projects/{project_gid}/addCustomFieldSetting",
+                        {"custom_field": field_gid, "is_important": False})
+        except _AsanaError:
+            return None  # cannot attach (not a member/permission) -> degrade to comments, never abort
+    return {"field_gid": field_gid, "options": options}
+
+
+def _existing_kb_tasks(client, section_gid: str) -> dict:
+    """Owned tasks currently in the KB section, {title: {gid, completed}}. Section-scoped and OWNED_RE-filtered,
+    so [Build]/[Chip] tasks (in the project's default section) are never even seen. No `completed_since` is
+    passed, so completed tasks ARE returned and reopen can fire on a human-closed KB task."""
+    out: dict = {}
+    for t in client.get_all(f"/sections/{section_gid}/tasks", {"opt_fields": "name,completed"}):
+        name = t.get("name", "")
+        if _finding_id_from_title(name):
+            out[name] = {"gid": t.get("gid"), "completed": bool(t.get("completed"))}
+    return out
+
+
+def _apply_verification(client, task_gid: str, state: str, vfield: dict | None, commit: bool) -> None:
+    """Record a verification state on a task: set the shared enum option when the field is attached and has that
+    option, else degrade to a comment story. Commit-gated; a failure here never sinks the run, the task's
+    completed/open state is already correct."""
+    if not commit or not task_gid:
+        return
+    try:
+        if vfield and state in (vfield.get("options") or {}):
+            client.put(f"/tasks/{task_gid}", {"custom_fields": {vfield["field_gid"]: vfield["options"][state]}})
+        else:
+            client.post(f"/tasks/{task_gid}/stories", {"text": f"KB verification: {state}"})
+    except _AsanaError:
+        pass
+
+
+def _create_task(client, cfg: dict, section_gid: str | None, finding: dict, vfield: dict | None,
+                 commit: bool, counts: dict) -> None:
+    """Create one findings task titled `[id] subject`, add it to the KB section, assign it, mark it unverified.
+    Per-task resilience: a stale owner_gid (no longer a workspace member) 400s the create, so retry once
+    unassigned rather than lose the finding."""
+    if not commit:
+        counts["created"] += 1
+        return
+    tracking = cfg.get("tracking", {}) or {}
+    project_gid = str(tracking.get("project_gid") or "").strip()
+    default_assignee = str(tracking.get("default_assignee") or "").strip()
+    owner_gid = finding.get("owner_gid")
+    assignee = str(owner_gid).strip() if owner_gid else default_assignee
+    body = {"name": _finding_title(finding), "notes": finding.get("detail", ""), "projects": [project_gid]}
+    if assignee:
+        body["assignee"] = assignee
+    try:
+        created = client.post("/tasks", body)
+    except _AsanaError:
+        if not assignee:
+            counts["failed"] += 1
+            return
+        body.pop("assignee", None)
+        try:
+            created = client.post("/tasks", body)
+        except _AsanaError:
+            counts["failed"] += 1
+            return
+    task_gid = created.get("data", {}).get("gid")
+    if section_gid and task_gid:
+        try:
+            client.post(f"/sections/{section_gid}/addTask", {"task": task_gid})
+        except _AsanaError:
+            pass  # landed in the project's default section; not fatal
+    _apply_verification(client, task_gid, "unverified", vfield, commit)
+    counts["created"] += 1
+
+
+def _reorder_section_by_entity(client, section_gid: str, findings: list, counts: dict) -> None:
+    """Leave the KB section grouped by entity then key (the same order the dry-run prints). No-op when already
+    ordered. The section is KB-only, so this never disturbs [Build]/[Chip] ordering; it moves only owned open
+    tasks that are still desired."""
+    ordered = sorted(findings, key=lambda f: (str(f["entity"]), f["key"]))
+    desired_titles = [_finding_title(f) for f in ordered]
+    tasks = client.get_all(f"/sections/{section_gid}/tasks", {"opt_fields": "name,completed"})
+    by_title = {t.get("name"): t.get("gid") for t in tasks
+                if not t.get("completed") and _finding_id_from_title(t.get("name", ""))}
+    current = [t.get("name") for t in tasks
+               if not t.get("completed") and _finding_id_from_title(t.get("name", ""))]
+    target = [tt for tt in desired_titles if tt in by_title]
+    if current == target:
+        return
+    prev_gid = None
+    for tt in target:
+        gid = by_title[tt]
+        if prev_gid is not None:
+            client.post(f"/sections/{section_gid}/addTask", {"task": gid, "insert_after": prev_gid})
+        prev_gid = gid
+    counts["reordered"] += 1
+
+
+def _reconcile(client, cfg: dict, findings: list, active_ids: set, commit: bool) -> dict:
+    """The audit-family reconcile: create / no-op / verify-clear / reopen the tool's own `[KB-*]` tasks in the
+    KB section, gated by the active-family set. Re-discovery is the judge of "done": a finding still present
+    keeps (or reopens) its task; a finding absent from the freshly-computed set (its family collected)
+    verify-clears its task; a family NOT collected this run is left untouched."""
+    tracking = cfg.get("tracking", {}) or {}
+    project_gid = str(tracking.get("project_gid") or "").strip()
+    workspace_gid = str(tracking.get("workspace_gid") or "").strip()
+    section_name = str(tracking.get("section_name") or "KB Findings").strip()
+    field_name = str(tracking.get("verification_field") or "Verification").strip()
+    if not project_gid:
+        raise SystemExit("reconcile needs [tracking].project_gid in config.toml")
+
+    counts = {"created": 0, "noop": 0, "reopened": 0, "verify_cleared": 0,
+              "skipped_inactive": 0, "reordered": 0, "failed": 0}
+
+    section_gid = _ensure_kb_section(client, project_gid, section_name, commit)
+    vfield = _ensure_verification_field(client, workspace_gid, project_gid, field_name, commit)
+    existing = _existing_kb_tasks(client, section_gid) if section_gid else {}
+    desired = {_finding_title(f): f for f in findings}
+
+    # Pass A: create the missing, reopen a human-closed but still-present finding, no-op an already-open one.
+    for title, finding in desired.items():
+        task = existing.get(title)
+        if task is None:
+            _create_task(client, cfg, section_gid, finding, vfield, commit, counts)
+        elif task["completed"]:
+            # Its family is active by construction (we only computed the finding because we collected its
+            # surface), but gate defensively anyway.
+            if finding["finding_id"] not in active_ids:
+                counts["skipped_inactive"] += 1
+                continue
+            if commit:
+                try:
+                    client.put(f"/tasks/{task['gid']}", {"completed": False})
+                except _AsanaError:
+                    counts["failed"] += 1
+                    continue
+                _apply_verification(client, task["gid"], "verification-failed", vfield, commit)
+            counts["reopened"] += 1
+        else:
+            counts["noop"] += 1
+
+    # Pass B: verify-clear an owned task whose condition is gone, but only for a family that was collected.
+    for name, task in existing.items():
+        if name in desired:
+            continue
+        if _finding_id_from_title(name) not in active_ids:
+            counts["skipped_inactive"] += 1  # uncollected family -> leave exactly as-is, never auto-clear
+            continue
+        if task["completed"]:
+            continue  # already clear
+        if commit:
+            try:
+                client.put(f"/tasks/{task['gid']}", {"completed": True})
+            except _AsanaError:
+                counts["failed"] += 1
+                continue
+            _apply_verification(client, task["gid"], "verified-clear", vfield, commit)
+        counts["verify_cleared"] += 1
+
+    if commit and section_gid:
+        _reorder_section_by_entity(client, section_gid, findings, counts)
+    return counts
 
 
 def cmd_feedback(args) -> int:
@@ -824,8 +1234,10 @@ def cmd_feedback(args) -> int:
 
     `--log` appends one usage/rating/miss record to the interaction log. The default collects the gap +
     conflict signals from that log and the ROT flags from an optional repo sweep, computes the finding set
-    (owned KB-* ids, stable keys, grouped by entity), and prints the dry-run raise plan. The Asana read +
-    upsert leg is a deferred follow-up gated on the tracking PAT location in config; nothing is written here.
+    (owned KB-* ids, stable keys, grouped by entity), and prints the raise plan. Without `--commit` that is
+    all it does (dry-run, fully offline, no PAT). With `--commit` it then reconciles the plan into the KB
+    Findings section of the tracking project: create / no-op / verify-clear / reopen the tool's own `[KB-*]`
+    tasks, gated by the active-family set, per the kacific-audit-governance contract.
     """
     log_path = Path(args.log_file)
 
@@ -855,38 +1267,66 @@ def cmd_feedback(args) -> int:
     else:
         notes.append(f"gap+conflict family skipped (log not collected: {log_path})")
 
-    if args.repo:
-        nuggets = _load_nuggets(Path(args.repo))
-        findings.extend(_rot_findings(_rot_flags(nuggets, datetime.now(timezone.utc))))
-    else:
+    rot_collected = False
+    if not args.repo:
         notes.append("ROT family skipped (no --repo swept)")
+    else:
+        try:
+            nuggets = _load_nuggets(Path(args.repo))
+        except OSError:
+            nuggets = []
+        if nuggets:
+            rot_collected = True
+            findings.extend(_rot_findings(_rot_flags(nuggets, datetime.now(timezone.utc))))
+        else:
+            # A mis-pointed or empty --repo reads identically to "collected, found nothing", which would let
+            # the reconcile auto-clear every ROT task. Treat zero nuggets as NOT collected (the active-family
+            # gate): prefer a missed clear (a stale task the next good run closes) over a false clear.
+            notes.append(f"ROT family skipped (no nuggets read at {args.repo}; treated as not collected)")
 
-    if not findings:
+    # Report the plan grouped by entity, whether or not we then commit (owner for ROT; (triage) for
+    # gaps + conflicts). No-op when already ordered.
+    if findings:
+        by_entity: dict = {}
+        for f in findings:
+            by_entity.setdefault(f["entity"], []).append(f)
+        n_ent = len(by_entity)
+        mode = "committing to Asana" if args.commit else \
+            "dry-run; add --commit and a resolvable tracking PAT in config to raise these"
+        print(f"feedback: {len(findings)} finding(s) across {n_ent} "
+              f"{'entity' if n_ent == 1 else 'entities'} ({mode}).\n")
+        for entity in sorted(by_entity):
+            print(f"entity: {entity}")
+            for f in sorted(by_entity[entity], key=lambda x: x["key"]):
+                print(f"  - [{f['finding_id']}] {f['key']}")
+                print(f"      {f['detail']}")
+            print()
+        if notes:
+            print("notes (a surface not collected is left as-is, never auto-cleared):")
+            for n in notes:
+                print(f"  - {n}")
+            print()
+    else:
         line = "feedback: no findings."
         if notes:
             line += " " + " ".join(f"[{n}]" for n in notes)
         print(line)
+
+    if not args.commit:
         return 0
 
-    # Group-by-entity final sort (owner for ROT; (triage) for gaps + conflicts). No-op when already ordered.
-    by_entity: dict = {}
-    for f in findings:
-        by_entity.setdefault(f["entity"], []).append(f)
-    n_ent = len(by_entity)
-    print(f"feedback: {len(findings)} finding(s) across {n_ent} "
-          f"{'entity' if n_ent == 1 else 'entities'} "
-          f"(dry-run; the Asana raise leg is deferred, it needs the tracking PAT location in config).\n")
-    for entity in sorted(by_entity):
-        print(f"entity: {entity}")
-        for f in sorted(by_entity[entity], key=lambda x: x["key"]):
-            print(f"  - [{f['finding_id']}] {f['key']}")
-            print(f"      {f['detail']}")
-        print()
-    if notes:
-        print("notes (a surface not collected is left as-is, never auto-cleared):")
-        for n in notes:
-            print(f"  - {n}")
-        print()
+    # Live reconcile. Even with zero findings this must run, so a condition that has cleared (its family
+    # collected) gets its task verify-cleared. The PAT is resolved here, never on the dry-run path.
+    config = load_config(args.config)
+    pat = _resolve_tracking_pat(config)
+    client = _AsanaClient(pat)
+    active_ids = _active_ids(log_collected, rot_collected)
+    try:
+        counts = _reconcile(client, config, findings, active_ids, True)
+    except _AsanaError as exc:
+        print(f"feedback: Asana reconcile failed: {exc}", file=sys.stderr)
+        return 1
+    print("reconcile: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
     return 0
 
 
@@ -957,6 +1397,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--query", help="the query text for --log")
     sp.add_argument("--nugget", help="nugget id the --log record refers to (optional)")
     sp.add_argument("--rating", choices=["helpful", "unhelpful"], help="rating for a --log --kind rating record")
+    sp.add_argument("--commit", action="store_true",
+                    help="reconcile the finding set into Asana (create/no-op/verify-clear/reopen); "
+                         "default is an offline dry-run that only prints the plan")
+    sp.add_argument("--config", default="config.toml", help="path to config.toml (used with --commit)")
     sp.set_defaults(func=cmd_feedback)
 
     for name in ("prescan", "export"):
