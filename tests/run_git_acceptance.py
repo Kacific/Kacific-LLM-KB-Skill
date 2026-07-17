@@ -88,9 +88,19 @@ def write_manifest(admin: Path, cache: Path, remotes: dict[str, tuple[str, str]]
     seeds, when given, adds [seed_sources.<key>] blocks (string or list values) for prescan checks.
     """
     lines = []
+    seen: list = []
     for key, (url, audience) in remotes.items():
         lines += [f"[managed.{key}]", f'url = "{url}"', f'audience = "{audience}"', ""]
-    lines += ["[audiences]", 'AllStaff = ["AllStaff"]', 'Technical = ["AllStaff", "Technical"]', ""]
+        if audience not in seen:
+            seen.append(audience)
+    # Derive the visibility map from the remotes: AllStaff sees only itself; every other audience sees the
+    # AllStaff base plus its own area (the department model). Keeps existing AllStaff/Technical tests intact
+    # while letting new tests add Commercial etc. and prove cross-department exclusion.
+    lines += ["[audiences]"]
+    for audience in seen:
+        visible = f'["AllStaff", "{audience}"]' if audience != "AllStaff" else '["AllStaff"]'
+        lines += [f'{audience} = {visible}']
+    lines += [""]
     for key, spec in (seeds or {}).items():
         lines += [f"[seed_sources.{key}]"]
         for k, v in spec.items():
@@ -566,6 +576,65 @@ def prescan_path_seed_skips_clone():
         ok = (p.returncode == 0 and src["status"] == "ok" and bool(src.get("head_sha"))
               and src["counts"]["candidates"] == 1 and no_clone)
         return ok, f"rc={p.returncode} head={bool(src.get('head_sha'))} no_clone={no_clone}"
+
+
+@check
+def index_publish_slices_are_scoped_idempotent_and_clean():
+    """index --manifest --publish commits each repo its audience slice, is a no-op re-run, and sync stays clean.
+
+    Three repos across three audiences. The Technical slice must carry the AllStaff base plus its own entry;
+    the AllStaff slice must carry only AllStaff (no Technical/Commercial leak). A second publish must push no
+    new commit (the slice is byte-identical bar the timestamp, which is not compared). And `sync` after a
+    publish must report clean: publishing moves each repo's HEAD, but index records the post-publish sha into
+    the aggregate baseline, so there is no spurious "repo changed".
+    """
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        admin = root / "admin"; admin.mkdir()
+        cache = root / "cache"
+        url_a = make_remote(root, "allstaff", {
+            "shared/wifi.md": nugget("shared-wifi", "shared", "Wifi", "Join the staff SSID to get online."),
+        })
+        url_t = make_remote(root, "technical", {
+            "technical/net.md": nugget("tech-net", "technical", "Net", "The core switch lives in rack 3."),
+        })
+        url_c = make_remote(root, "commercial", {
+            "commercial/plan.md": nugget("comm-plan", "commercial", "Plan", "The GS service plan tiers."),
+        })
+        remotes = {"allstaff": (url_a, "AllStaff"), "technical": (url_t, "Technical"),
+                   "commercial": (url_c, "Commercial")}
+        cfg = write_manifest(admin, cache, remotes)
+
+        pub = kb("index", "--manifest", "--publish", "--config", str(cfg))
+        if pub.returncode != 0 or "publish technical: published" not in pub.stdout:
+            return False, f"publish rc={pub.returncode} stdout={pub.stdout.strip()!r}"
+
+        # A fresh clone of each remote proves the slice was pushed, not just written locally.
+        def remote_ids(url: str, key: str) -> set:
+            vdir = root / f"verify-{key}"
+            git("clone", "--quiet", url, str(vdir))
+            reg = json.loads((vdir / "registry.json").read_text(encoding="utf-8"))
+            return {e["id"] for e in reg["entries"]}, reg.get("audience")
+
+        tech_ids, tech_aud = remote_ids(url_t, "technical")
+        all_ids, all_aud = remote_ids(url_a, "allstaff")
+        tech_scoped = tech_ids == {"shared-wifi", "tech-net"} and tech_aud == "Technical"
+        allstaff_scoped = all_ids == {"shared-wifi"} and all_aud == "AllStaff"  # no Technical/Commercial leak
+
+        # Second publish is a no-op: the technical remote HEAD must not move.
+        head1 = git("ls-remote", url_t, "main").stdout.split()[0]
+        pub2 = kb("index", "--manifest", "--publish", "--config", str(cfg))
+        head2 = git("ls-remote", url_t, "main").stdout.split()[0]
+        idempotent = (pub2.returncode == 0 and head1 == head2
+                      and "publish technical: unchanged" in pub2.stdout)
+
+        # Sync after publish must be clean (no spurious "repo changed" from the manager's own slice commits).
+        s = kb("sync", "--config", str(cfg))
+        clean = s.returncode == 0 and "clean" in s.stdout and "repo changed" not in s.stdout
+
+        ok = tech_scoped and allstaff_scoped and idempotent and clean
+        return ok, (f"tech={tech_scoped} allstaff={allstaff_scoped} idempotent={idempotent} "
+                    f"clean={clean} sync={s.stdout.strip()!r}")
 
 
 def main() -> int:
