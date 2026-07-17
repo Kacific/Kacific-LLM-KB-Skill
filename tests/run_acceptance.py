@@ -613,6 +613,73 @@ def prescan_source_url_and_dedup_norm():
     return forms and ref_free and roots and distinct, f"forms={forms} ref_free={ref_free} roots={roots} distinct={distinct}"
 
 
+# --- audience slicing -------------------------------------------------------
+
+def _slice_aggregate() -> dict:
+    """A synthetic cross-audience aggregate: one entry sourced from each of four department repos."""
+    def e(nid, repo):
+        return {"id": nid, "title": nid, "domain": repo, "status": "published", "source_repo": repo}
+    return {
+        "repos": {
+            "allstaff": {"audience": "AllStaff"},
+            "technical": {"audience": "Technical"},
+            "commercial": {"audience": "Commercial"},
+            "hr": {"audience": "HR"},
+        },
+        "entries": [e("a-base", "allstaff"), e("t-net", "technical"),
+                    e("c-plan", "commercial"), e("h-leave", "hr")],
+    }
+
+
+_AUDIENCES = {
+    "AllStaff": ["AllStaff"],
+    "Technical": ["AllStaff", "Technical"],
+    "Commercial": ["AllStaff", "Commercial"],
+    "HR": ["AllStaff", "HR"],
+}
+
+
+@check
+def slice_dept_gets_base_plus_own():
+    slices = kb.derive_slices(_slice_aggregate(), _AUDIENCES)
+    ids = {k: sorted(x["id"] for x in v) for k, v in slices.items()}
+    ok = (ids["technical"] == ["a-base", "t-net"]
+          and ids["commercial"] == ["a-base", "c-plan"]
+          and ids["hr"] == ["a-base", "h-leave"]
+          and ids["allstaff"] == ["a-base"])
+    return ok, f"ids={ids}"
+
+
+@check
+def slice_never_leaks_across_departments():
+    slices = kb.derive_slices(_slice_aggregate(), _AUDIENCES)
+    ids = {k: {x["id"] for x in v} for k, v in slices.items()}
+    # AllStaff sees no department entry; Technical sees no Commercial/HR; Commercial sees no Technical/HR.
+    allstaff_clean = ids["allstaff"] == {"a-base"}
+    technical_clean = not ({"c-plan", "h-leave"} & ids["technical"])
+    commercial_clean = not ({"t-net", "h-leave"} & ids["commercial"])
+    ok = allstaff_clean and technical_clean and commercial_clean
+    return ok, f"allstaff={allstaff_clean} technical={technical_clean} commercial={commercial_clean} ids={ids}"
+
+
+@check
+def slice_default_deny_for_unmapped_audience():
+    # A repo whose audience label is absent from the [audiences] map must get an empty slice, never the full
+    # aggregate; leaving one out of the map must never silently publish everything.
+    slices = kb.derive_slices(_slice_aggregate(), {"AllStaff": ["AllStaff"]})
+    ok = slices["allstaff"] == [{"id": "a-base", "title": "a-base", "domain": "allstaff",
+                                 "status": "published", "source_repo": "allstaff"}] \
+        and slices["technical"] == [] and slices["commercial"] == [] and slices["hr"] == []
+    return ok, f"technical={slices['technical']} commercial={slices['commercial']} hr={slices['hr']}"
+
+
+@check
+def slice_entries_carry_source_repo():
+    slices = kb.derive_slices(_slice_aggregate(), _AUDIENCES)
+    ok = all("source_repo" in e for v in slices.values() for e in v)
+    return ok, f"all_have_source_repo={ok}"
+
+
 def main() -> int:
     failures = 0
     for fn in CHECKS:

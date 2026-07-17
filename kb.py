@@ -404,11 +404,14 @@ def _registry_markdown(name: str, generated_utc: str, entries: list) -> str:
     def cell(value) -> str:
         return str(value or "").replace("|", "\\|")
 
-    lines.append("| id | title | domain | type | status | verified |")
-    lines.append("|---|---|---|---|---|---|")
+    # The repo column names the source repo that holds each entry's body, so a reader of a sliced mirror
+    # (which carries the AllStaff base plus its own) can tell which repo to pull for a given nugget. It is
+    # blank for a self-only mirror built by `index --repo`, whose entries carry no source_repo.
+    lines.append("| id | title | domain | type | status | verified | repo |")
+    lines.append("|---|---|---|---|---|---|---|")
     for e in sorted(entries, key=lambda e: e["id"]):
         row = (e.get("id"), e.get("title"), e.get("domain"), e.get("type"),
-               e.get("status"), e.get("last_verified"))
+               e.get("status"), e.get("last_verified"), e.get("source_repo"))
         lines.append("| " + " | ".join(cell(v) for v in row) + " |")
     return "\n".join(lines) + "\n"
 
@@ -442,6 +445,79 @@ def build_aggregate(manifest: dict, *, ttl_seconds: int = 0, force: bool = False
         "repos": repos_out,
         "entries": entries,
     }
+
+
+def derive_slices(aggregate: dict, audiences: dict) -> dict:
+    """Derive each managed repo's audience-scoped registry slice from the full aggregate.
+
+    A slice is what a repo publishes to its readers: the aggregate entries they are cleared to see, per the
+    manifest [audiences] map (for example Technical = [AllStaff, Technical], so the Technical repo carries the
+    AllStaff base plus its own entries). Returns {repo_key: [entry, ...]}; each entry keeps its source_repo so
+    a reader knows which repo holds the body (an AllStaff base entry in the Technical slice still lives in the
+    AllStaff repo).
+
+    Leak-safe by construction and DEFAULT-DENY: an entry is included only when the audience of its source_repo
+    is in the reader's visible set, and a repo whose audience label is absent from the [audiences] map gets an
+    empty slice, never the full aggregate. So restricted metadata can never fall into a lower-clearance slice.
+    """
+    repos = aggregate.get("repos", {})
+    entries = aggregate.get("entries", [])
+    # audience label of each source_repo key, e.g. {"allstaff": "AllStaff", "technical": "Technical"}.
+    repo_audience = {key: (spec or {}).get("audience") for key, spec in repos.items()}
+    slices: dict = {}
+    for key, spec in repos.items():
+        visible = set(audiences.get((spec or {}).get("audience"), []))
+        slices[key] = [e for e in entries if repo_audience.get(e.get("source_repo")) in visible]
+    return slices
+
+
+def _slice_doc(audience: str, generated_utc: str, entries: list) -> dict:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_utc": generated_utc,
+        "audience": audience,
+        "entries": entries,
+    }
+
+
+def _publish_slice(repo_dir: Path, audience: str, generated_utc: str, entries: list) -> tuple:
+    """Commit and push a repo's registry slice (registry.json + registry.md) into its own clone, on change.
+
+    The manager owns these two generated files, so publishing them is a manager write, not reader drift
+    (both are skipped by `_load_nuggets`). Change is measured on the slice ENTRIES and audience only, never
+    the generated_utc stamp, so an unchanged slice never churns a daily commit. Returns (new_head|None, note):
+    'unchanged' skips the commit, 'published' pushed a new commit (new_head is its sha, so the caller can keep
+    the sync baseline coherent), and any 'publish failed ...' leaves the remote untouched (for example when
+    run without write access, so the read-only cron path degrades quietly rather than aborting).
+    """
+    registry_path = repo_dir / "registry.json"
+    mirror_path = repo_dir / "registry.md"
+    new_doc = _slice_doc(audience, generated_utc, entries)
+    if registry_path.exists():
+        try:
+            existing = json.loads(registry_path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            existing = {}
+        if existing.get("entries") == entries and existing.get("audience") == audience:
+            return None, "unchanged"
+    registry_path.write_text(json.dumps(new_doc, indent=2) + "\n", encoding="utf-8")
+    mirror_path.write_text(_registry_markdown(audience, generated_utc, entries), encoding="utf-8")
+
+    branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=str(repo_dir)).stdout.strip()
+    if branch in ("", "HEAD"):  # detached: fall back to the remote default branch
+        ref = _git(["rev-parse", "--abbrev-ref", "origin/HEAD"], cwd=str(repo_dir)).stdout.strip()
+        branch = ref.split("/", 1)[-1] if ref else "main"
+        _git(["checkout", "-B", branch], cwd=str(repo_dir))
+    if _git(["add", "registry.json", "registry.md"], cwd=str(repo_dir)).returncode != 0:
+        return None, "publish failed (add)"
+    commit = _git(["-c", "user.name=kb-manager", "-c", "user.email=kb-manager@kacific.local",
+                   "commit", "--quiet", "-m", f"kb: publish registry slice for {audience}"], cwd=str(repo_dir))
+    if commit.returncode != 0:
+        return None, "publish failed (commit)"
+    if _git(["push", "--quiet", "origin", branch], cwd=str(repo_dir)).returncode != 0:
+        return None, "publish failed (push; write access?)"
+    head = _git(["rev-parse", "HEAD"], cwd=str(repo_dir))
+    return (head.stdout.strip() if head.returncode == 0 else None), "published"
 
 
 # --- retrieval (grounding-only, keyword match over stored nuggets) ----------
@@ -514,6 +590,36 @@ def cmd_index(args) -> int:
         manifest = load_manifest(config)
         ttl = args.max_age if args.max_age is not None else int(config.get("cache", {}).get("fetch_ttl_seconds", 0))
         agg = build_aggregate(manifest, ttl_seconds=ttl, force=args.force)
+
+        # Derive each repo's audience slice from the aggregate and write it to the control home for review,
+        # always (even without --publish), so the slices can be eyeballed before they reach any data repo.
+        slices = derive_slices(agg, manifest["audiences"])
+        slices_dir = manifest["manifest_path"].parent / "slices"
+        slices_dir.mkdir(parents=True, exist_ok=True)
+        for key, entries in sorted(slices.items()):
+            audience = (agg["repos"].get(key) or {}).get("audience") or key
+            (slices_dir / f"{key}.registry.json").write_text(
+                json.dumps(_slice_doc(audience, agg["generated_utc"], entries), indent=2) + "\n",
+                encoding="utf-8")
+
+        # --publish commits each CHANGED slice into its own data repo (a dev-Mac write step; the NUC cron
+        # keeps its read-only posture and never passes --publish). A published slice moves that repo's HEAD,
+        # so record the post-publish sha into the aggregate baseline to keep the next `sync` free of a
+        # spurious "repo changed" line.
+        published: dict = {}
+        if getattr(args, "publish", False):
+            cache_dir = manifest["cache_dir"]
+            for key, entries in sorted(slices.items()):
+                repo = agg["repos"].get(key) or {}
+                if repo.get("status") != "ok":
+                    published[key] = f"skipped ({repo.get('status')})"
+                    continue
+                audience = repo.get("audience") or key
+                new_head, note = _publish_slice(cache_dir / key, audience, agg["generated_utc"], entries)
+                published[key] = note
+                if new_head:
+                    agg["repos"][key]["head_sha"] = new_head
+
         out_path = (
             Path(args.out).expanduser() if args.out
             else manifest["manifest_path"].parent / "registry-aggregate.json"
@@ -523,6 +629,10 @@ def cmd_index(args) -> int:
         ok = [k for k, r in agg["repos"].items() if r["status"] == "ok"]
         print(f"OK: aggregate written to {out_path} "
               f"({len(agg['entries'])} entries across {len(ok)}/{len(agg['repos'])} managed repos).")
+        print(f"OK: {len(slices)} audience slices written to {slices_dir}"
+              + ("" if getattr(args, "publish", False) else " (review only; pass --publish to commit them)"))
+        for key in sorted(published):
+            print(f"  publish {key}: {published[key]}")
         for key, r in sorted(agg["repos"].items()):
             if r["status"] != "ok":
                 print(f"  WARN: repo '{key}': {r['status']}", file=sys.stderr)
@@ -1767,7 +1877,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("index", help="rebuild the registry from a repo, or --manifest for the aggregate")
     sp.add_argument("repo", nargs="?", help="single KB repo root to index; omit when using --manifest")
     sp.add_argument("--manifest", action="store_true",
-                    help="build the cross-repo aggregate from config [repos].manifest into the control home")
+                    help="build the cross-repo aggregate from config [repos].manifest, then derive each "
+                         "repo's audience slice into the control home (add --publish to commit the slices)")
     sp.add_argument("--config", default="config.toml", help="path to config.toml (used with --manifest)")
     sp.add_argument("--out",
                     help="output path; default stdout (single repo) or <manifest dir>/registry-aggregate.json")
@@ -1775,6 +1886,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="reuse a managed repo's clone without re-fetching if its last fetch is within this "
                          "window (default: config [cache].fetch_ttl_seconds, else 0 = always fetch)")
     sp.add_argument("--force", action="store_true", help="ignore the fetch cache and re-fetch every repo")
+    sp.add_argument("--publish", action="store_true",
+                    help="with --manifest, commit+push each changed audience slice into its data repo "
+                         "(a dev-Mac write step; needs write access, so the read-only cron never passes it)")
     sp.set_defaults(func=cmd_index)
 
     sp = sub.add_parser("answer", help="answer a query from stored nuggets")

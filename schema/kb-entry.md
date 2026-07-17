@@ -85,3 +85,11 @@ changes are additive only. A rename goes add, double-write, flip readers, then d
 The manager computes, per nugget, a content hash (over the body only, excluding manager-managed fields such
 as `verified`, so the manager's own writes never look like drift), the source repo, and the last-seen commit
 SHA. These live in the registry, not in the nugget frontmatter.
+
+Each data repo's published `registry.json` is its **audience slice**, not a self-only listing: the manager
+derives it from the private cross-audience aggregate per the manifest `[audiences]` map, so a repo carries the
+all-staff base plus its own area (for example Technical = AllStaff + Technical) and never any entry a lower-
+clearance reader may not see. Every slice entry keeps `source_repo` so a reader knows which repo holds the
+body of a base entry it did not originate. The slice is regenerated and published by `kb.py index --manifest
+--publish` (a write step); the standalone `kb.py index <repo>` path still produces a self-only listing for
+local inspection.
