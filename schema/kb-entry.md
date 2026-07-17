@@ -93,3 +93,13 @@ clearance reader may not see. Every slice entry keeps `source_repo` so a reader 
 body of a base entry it did not originate. The slice is regenerated and published by `kb.py index --manifest
 --publish` (a write step); the standalone `kb.py index <repo>` path still produces a self-only listing for
 local inspection.
+
+## Export bundle (neutral, ACL-aware)
+
+`kb.py export` renders a neutral, target-agnostic bundle for a document platform (SharePoint, Confluence,
+Box): each nugget becomes a reader-facing doc under `docs/` (Markdown, or HTML with `--format html`) carrying
+its provenance line and the same staleness caveat the answer contract adds, and a machine-readable
+`bundle.json` manifest lists every doc with its metadata plus an `acl` label. `export --manifest` produces one
+bundle per audience, assembled from the same audience slices, so a lower-clearance bundle never carries a
+higher department's doc. The bundle format and the per-target mapping live in
+[`docs/export-adapter-contract.md`](../docs/export-adapter-contract.md).

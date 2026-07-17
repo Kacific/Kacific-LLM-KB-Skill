@@ -12,7 +12,8 @@ Subcommands:
   sync      git-fetch each managed repo, diff SHA and per-nugget body hash, report drift (1b)
   prescan   one-time seed: scan the manifest's seed-source repos into ranked pointer candidates plus a
             captured-vs-gap report; --commit stages them for human review (secrets-safe by name)
-  export    render a neutral bundle (Markdown/HTML) for an export target (1b)
+  export    render a neutral, ACL-aware bundle (docs + bundle.json) for an export target (SharePoint /
+            Confluence / Box); --manifest produces one leak-safe bundle per audience slice
   feedback  append a usage/rating/miss record, or report gap/ROT/conflict findings; --commit reconciles
             them into the tracking project as Asana tasks (create/no-op/verify-clear/reopen) (1b)
   cache     inspect or clear the local, gitignored TTL lookup cache (git-fetch reuse; Asana lookups later)
@@ -24,6 +25,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import hashlib
+import html
 import json
 import re
 import shutil
@@ -1854,6 +1856,248 @@ def cmd_prescan(args) -> int:
     return 0
 
 
+# --- export: neutral, target-agnostic bundle (Markdown/HTML) ----------------
+# A bundle is a self-contained directory: rendered docs under docs/, plus a machine-readable bundle.json
+# manifest that any target's importer (SharePoint / Confluence / Box) maps onto its own structure. Manifest
+# mode produces one bundle per audience, assembled from derive_slices, so a lower-clearance bundle can never
+# carry a higher department's doc. Live API push to a specific target is a later step (see the adapter
+# contract doc); this renders the neutral artefact those adapters consume.
+
+def _reader_notes(meta: dict, now: datetime) -> list[str]:
+    """Reader-facing caveats for an exported doc, mirroring the answer contract's footnotes.
+
+    A staleness note when verified is missing or older than READER_STALE_DAYS (90), and a note when the
+    status is anything other than published, so exported prose stays as honest as a served answer.
+    """
+    notes = []
+    verified = _iso_date(meta.get("verified"))
+    if verified is None or (now - verified).days > READER_STALE_DAYS:
+        notes.append("Note: this document has not been audited recently.")
+    if meta.get("status") and meta["status"] != "published":
+        notes.append(f"Note: this document's status is '{meta['status']}', not published.")
+    return notes
+
+
+def _doc_provenance(meta: dict) -> str:
+    """The inline provenance line for an exported doc: a source, or a named attestation."""
+    if meta.get("provenance_type") == "attestation" or (not meta.get("source") and meta.get("attested_by")):
+        who = meta.get("attested_by") or "unknown"
+        on = meta.get("attested_on")
+        return f"Attested by: {who}" + (f" ({on})" if on else "")
+    return f"Source: {meta.get('source') or meta.get('id')}"
+
+
+def _render_doc_markdown(nugget: dict, now: datetime) -> str:
+    """Render one nugget as a neutral, reader-facing Markdown doc: title, provenance, body, caveats.
+
+    Frontmatter metadata rides in bundle.json, not the doc, so the doc stays clean prose any target renders
+    as-is. The wrapper text is plain (no em-dash, no markdown emphasis) so it survives the minimal HTML
+    converter unchanged and passes the voice gate.
+    """
+    m = nugget["meta"]
+    lines = [f"# {m.get('title') or m.get('id')}", ""]
+    lines.append(_doc_provenance(m))
+    lines.append(f"Verified: {m.get('verified') or 'unverified'}")
+    lines.append("")
+    lines.append(nugget["body"].strip())
+    notes = _reader_notes(m, now)
+    if notes:
+        lines.append("")
+        lines.extend(notes)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _md_inline_code(escaped: str) -> str:
+    """Wrap backtick code spans in <code> within an already-HTML-escaped line (backticks survive escaping)."""
+    parts = escaped.split("`")
+    if len(parts) < 3:
+        return escaped
+    return "".join(f"<code>{p}</code>" if i % 2 else p for i, p in enumerate(parts))
+
+
+def _markdown_to_html(md: str) -> str:
+    """A deliberately minimal, dependency-free Markdown to HTML block converter.
+
+    Handles ATX headings, blank-line paragraphs, unordered (-/*) and ordered (1.) lists, fenced ``` code
+    blocks, and backtick code spans. Every line is HTML-escaped first, so a nugget body can never inject live
+    markup. Inline bold/italic are left as literal characters (a documented limitation) to avoid fragile
+    regex over human prose; a target needing richer inline formatting converts from the Markdown bundle.
+    """
+    out: list[str] = []
+    para: list[str] = []
+    code_lines: list[str] = []
+    in_code = False
+    list_type = None  # "ul" or "ol", else None
+
+    def flush_para():
+        if para:
+            out.append("<p>" + "<br>\n".join(para) + "</p>")
+            para.clear()
+
+    def flush_list():
+        nonlocal list_type
+        if list_type:
+            out.append(f"</{list_type}>")
+            list_type = None
+
+    for raw in md.split("\n"):
+        if raw.strip().startswith("```"):
+            if in_code:
+                out.append("<pre><code>" + "\n".join(code_lines) + "</code></pre>")
+                code_lines = []
+                in_code = False
+            else:
+                flush_para(); flush_list()
+                in_code = True
+            continue
+        if in_code:
+            code_lines.append(html.escape(raw))
+            continue
+
+        stripped = raw.strip()
+        if not stripped:
+            flush_para(); flush_list()
+            continue
+
+        heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        ul = re.match(r"^[-*]\s+(.*)$", stripped)
+        ol = re.match(r"^\d+\.\s+(.*)$", stripped)
+        if heading:
+            flush_para(); flush_list()
+            level = len(heading.group(1))
+            out.append(f"<h{level}>{_md_inline_code(html.escape(heading.group(2)))}</h{level}>")
+        elif ul or ol:
+            flush_para()
+            want = "ul" if ul else "ol"
+            if list_type != want:
+                flush_list()
+                out.append(f"<{want}>")
+                list_type = want
+            out.append(f"<li>{_md_inline_code(html.escape((ul or ol).group(1)))}</li>")
+        else:
+            flush_list()
+            para.append(_md_inline_code(html.escape(stripped)))
+
+    if in_code:  # unterminated fence: emit what we captured rather than drop it
+        out.append("<pre><code>" + "\n".join(code_lines) + "</code></pre>")
+    flush_para(); flush_list()
+    return "\n".join(out) + "\n"
+
+
+def _render_doc_html(nugget: dict, now: datetime) -> str:
+    """Render one nugget as a minimal, self-contained HTML page for a target that ingests HTML directly."""
+    m = nugget["meta"]
+    title = html.escape(str(m.get("title") or m.get("id")))
+    inner = _markdown_to_html(_render_doc_markdown(nugget, now))
+    return (
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+        f"<title>{title}</title>\n</head>\n<body>\n<article>\n{inner}</article>\n</body>\n</html>\n"
+    )
+
+
+def _bundle_manifest(audience: str, generated_utc: str, docs_meta: list, fmt: str) -> dict:
+    """The neutral, machine-readable manifest a target adapter maps onto its own structure."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_utc": generated_utc,
+        "audience": audience,
+        "target_neutral": True,
+        "format": fmt,
+        "docs": docs_meta,
+    }
+
+
+def _assemble_bundle(audience: str, entries: list, id_to_nugget: dict, now: datetime, fmt: str) -> tuple:
+    """Assemble one audience bundle from its registry entries and the loaded nugget bodies (pure, no I/O).
+
+    Each entry is mapped to its nugget body by id and rendered; an entry with no loadable body is skipped
+    defensively (it should not occur in a coherent aggregate). Returns (docs_meta, files) where docs_meta is
+    the per-doc manifest metadata (registry fields + the audience acl label + relative path) and files maps a
+    relative path to the rendered content. Leak-safety is upstream in derive_slices; this only renders what it
+    is given.
+    """
+    ext = "html" if fmt == "html" else "md"
+    docs_meta: list = []
+    files: dict = {}
+    for e in sorted(entries, key=lambda e: e.get("id") or ""):
+        nugget = id_to_nugget.get(e.get("id"))
+        if nugget is None:
+            continue
+        rel = f"docs/{_slugify(e['id'])}.{ext}"
+        files[rel] = _render_doc_html(nugget, now) if fmt == "html" else _render_doc_markdown(nugget, now)
+        meta = dict(e)
+        meta["acl"] = audience
+        meta["path"] = rel
+        docs_meta.append(meta)
+    return docs_meta, files
+
+
+def _write_bundle(out_dir: Path, manifest: dict, files: dict) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for rel, content in files.items():
+        path = out_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    (out_dir / "bundle.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def cmd_export(args) -> int:
+    fmt = getattr(args, "format", "markdown")
+    if not args.out:
+        print("export: --out <dir> is required (a bundle is a directory).", file=sys.stderr)
+        return 2
+    out_root = Path(args.out).expanduser()
+    now = datetime.now(timezone.utc)
+    generated = _now_iso()
+
+    if getattr(args, "manifest", False):
+        # ACL-aware: one bundle per audience, assembled from the aggregate's per-audience slices. Cloning
+        # private repos needs the same GH_TOKEN + GIT_CONFIG credential recipe as `index --manifest`; this is
+        # read-only (no push).
+        config = load_config(args.config)
+        manifest = load_manifest(config)
+        ttl = args.max_age if args.max_age is not None else int(config.get("cache", {}).get("fetch_ttl_seconds", 0))
+        agg = build_aggregate(manifest, ttl_seconds=ttl, force=args.force)
+        slices = derive_slices(agg, manifest["audiences"])
+        # Load each source repo's nuggets once, keyed by id, so a shared base entry that appears in several
+        # slices renders from a single loaded body.
+        id_to_nugget: dict = {}
+        cache_dir = manifest["cache_dir"]
+        for key, repo in agg["repos"].items():
+            if repo.get("status") != "ok":
+                continue
+            for n in _load_nuggets(cache_dir / key):
+                id_to_nugget[n["meta"]["id"]] = n
+        written = []
+        for key, entries in sorted(slices.items()):
+            audience = (agg["repos"].get(key) or {}).get("audience") or key
+            docs_meta, files = _assemble_bundle(audience, entries, id_to_nugget, now, fmt)
+            _write_bundle(out_root / key, _bundle_manifest(audience, generated, docs_meta, fmt), files)
+            written.append((key, audience, len(docs_meta)))
+        print(f"OK: {len(written)} audience bundles written to {out_root} (format: {fmt}).")
+        for key, audience, count in written:
+            print(f"  {key} ({audience}): {count} docs")
+        for key, r in sorted(agg["repos"].items()):
+            if r["status"] != "ok":
+                print(f"  WARN: repo '{key}': {r['status']}", file=sys.stderr)
+        return 0
+
+    if not args.repo:
+        print("export: give a repo path, or --manifest for ACL-aware per-audience bundles.", file=sys.stderr)
+        return 2
+    root = Path(args.repo)
+    nuggets = _load_nuggets(root)
+    id_to_nugget = {n["meta"]["id"]: n for n in nuggets}
+    entries = [_registry_entry(n) for n in nuggets]
+    # The audience label of a self-only repo export is the last hyphen segment of its dir name
+    # (Kacific-LLM-KB-Info-AllStaff -> AllStaff), matching the index --repo mirror convention.
+    audience = root.resolve().name.rsplit("-", 1)[-1]
+    docs_meta, files = _assemble_bundle(audience, entries, id_to_nugget, now, fmt)
+    _write_bundle(out_root, _bundle_manifest(audience, generated, docs_meta, fmt), files)
+    print(f"OK: bundle written to {out_root} ({len(docs_meta)} docs, audience {audience}, format {fmt}).")
+    return 0
+
+
 def _stub(name):
     def _run(args):
         print(f"{name}: not yet implemented (Phase 1b)", file=sys.stderr)
@@ -1949,8 +2193,22 @@ def build_parser() -> argparse.ArgumentParser:
                          "default is report-only")
     sp.set_defaults(func=cmd_prescan)
 
-    sp = sub.add_parser("export", help="export (Phase 1b)")
-    sp.set_defaults(func=_stub("export"))
+    sp = sub.add_parser("export",
+                        help="render a neutral bundle (docs + bundle.json) for an export target; "
+                             "--manifest for ACL-aware per-audience bundles")
+    sp.add_argument("repo", nargs="?", help="single KB repo root to export; omit when using --manifest")
+    sp.add_argument("--manifest", action="store_true",
+                    help="build ACL-aware per-audience bundles from config [repos].manifest (one leak-safe "
+                         "bundle per managed repo's audience slice); needs read access to the private repos")
+    sp.add_argument("--config", default="config.toml", help="path to config.toml (used with --manifest)")
+    sp.add_argument("--out", help="output directory for the bundle (required)")
+    sp.add_argument("--format", choices=["markdown", "html"], default="markdown",
+                    help="doc render format (default: markdown; html emits a minimal self-contained page)")
+    sp.add_argument("--max-age", type=int, default=None, metavar="SECONDS",
+                    help="reuse a managed repo's clone without re-fetching if its last fetch is within this "
+                         "window (default: config [cache].fetch_ttl_seconds, else 0 = always fetch)")
+    sp.add_argument("--force", action="store_true", help="ignore the fetch cache and re-fetch every repo")
+    sp.set_defaults(func=cmd_export)
 
     return p
 
