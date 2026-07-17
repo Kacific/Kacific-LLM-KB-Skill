@@ -637,6 +637,54 @@ def index_publish_slices_are_scoped_idempotent_and_clean():
                     f"clean={clean} sync={s.stdout.strip()!r}")
 
 
+@check
+def export_manifest_bundles_are_scoped_per_audience():
+    """export --manifest writes one leak-safe bundle per audience: docs + a valid bundle.json.
+
+    Three repos across three audiences. The Technical bundle must carry the AllStaff base doc plus its own;
+    the AllStaff bundle must carry only the base (no Technical/Commercial doc file). Read-only: no repo HEAD
+    moves. Proven from the written bundle directories, not the clones.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        admin = root / "admin"; admin.mkdir()
+        cache = root / "cache"
+        url_a = make_remote(root, "allstaff", {
+            "shared/wifi.md": nugget("shared-wifi", "shared", "Wifi", "Join the staff SSID to get online."),
+        })
+        url_t = make_remote(root, "technical", {
+            "technical/net.md": nugget("tech-net", "technical", "Net", "The core switch lives in rack 3."),
+        })
+        url_c = make_remote(root, "commercial", {
+            "commercial/plan.md": nugget("comm-plan", "commercial", "Plan", "The GS service plan tiers."),
+        })
+        remotes = {"allstaff": (url_a, "AllStaff"), "technical": (url_t, "Technical"),
+                   "commercial": (url_c, "Commercial")}
+        cfg = write_manifest(admin, cache, remotes)
+
+        out = root / "bundles"
+        head_a = git("ls-remote", url_a, "main").stdout.split()[0]
+        p = kb("export", "--manifest", "--config", str(cfg), "--out", str(out))
+        head_a_after = git("ls-remote", url_a, "main").stdout.split()[0]
+
+        def bundle(key: str):
+            man = json.loads((out / key / "bundle.json").read_text(encoding="utf-8"))
+            docs = {f.name for f in (out / key / "docs").glob("*.md")}
+            return {dm["id"] for dm in man["docs"]}, man.get("audience"), docs
+
+        tech_ids, tech_aud, tech_files = bundle("technical")
+        all_ids, all_aud, all_files = bundle("allstaff")
+        tech_scoped = (tech_ids == {"shared-wifi", "tech-net"} and tech_aud == "Technical"
+                       and tech_files == {"shared-wifi.md", "tech-net.md"})
+        allstaff_scoped = (all_ids == {"shared-wifi"} and all_aud == "AllStaff"
+                           and "tech-net.md" not in all_files)  # no cross-department leak
+        read_only = head_a == head_a_after  # export never pushes
+
+        ok = p.returncode == 0 and tech_scoped and allstaff_scoped and read_only
+        return ok, (f"rc={p.returncode} tech={tech_scoped} allstaff={allstaff_scoped} "
+                    f"read_only={read_only} stdout={p.stdout.strip()!r}")
+
+
 def main() -> int:
     failures = 0
     for fn in CHECKS:

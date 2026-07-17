@@ -680,6 +680,89 @@ def slice_entries_carry_source_repo():
     return ok, f"all_have_source_repo={ok}"
 
 
+# --- export: neutral bundle -------------------------------------------------
+
+def _nugget_dict(**meta) -> dict:
+    """A {meta, body, path} nugget for the pure export renderers (no file, no store gate)."""
+    body = meta.pop("_body", "A neutral body line, comfortably human.")
+    base = {"id": "x-note", "title": "X note", "status": "published",
+            "provenance_type": "attestation", "attested_by": "Example Engineer",
+            "attested_on": "2020-01-01", "verified": "2020-01-01"}
+    base.update(meta)
+    return {"meta": base, "body": body, "path": Path("x-note.md")}
+
+
+_NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+@check
+def export_single_repo_bundle_matches_nuggets():
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "bundle"
+        p = run("export", str(FIXTURE_KB), "--out", str(out))
+        nuggets = kb._load_nuggets(FIXTURE_KB)
+        manifest = json.loads((out / "bundle.json").read_text()) if (out / "bundle.json").exists() else {}
+        docs = sorted((out / "docs").glob("*.md")) if (out / "docs").exists() else []
+        ok = (p.returncode == 0 and len(docs) == len(nuggets)
+              and len(manifest.get("docs", [])) == len(nuggets)
+              and manifest.get("target_neutral") is True and manifest.get("format") == "markdown"
+              and all(dm.get("path", "").startswith("docs/") and dm.get("acl") for dm in manifest["docs"]))
+    return ok, f"rc={p.returncode} docs={len(docs)} nuggets={len(nuggets)} manifest_docs={len(manifest.get('docs', []))}"
+
+
+@check
+def export_markdown_carries_body_provenance_and_staleness():
+    md = kb._render_doc_markdown(
+        _nugget_dict(title="VPN reset", provenance_type="reference", source="runbooks/vpn.md",
+                     attested_by=None, attested_on=None, verified="2020-01-01",
+                     _body="Steps to reset the VPN token."),
+        _NOW)
+    ok = ("# VPN reset" in md and "Source: runbooks/vpn.md" in md
+          and "Steps to reset the VPN token." in md
+          and "Note: this document has not been audited recently." in md)
+    return ok, f"md={md!r}"
+
+
+@check
+def export_html_escapes_and_converts_blocks():
+    html_out = kb._render_doc_html(
+        _nugget_dict(title="Danger", _body="<script>alert(1)</script>\n\n# Sub\n\n- one\n- two"),
+        _NOW)
+    escaped = "&lt;script&gt;" in html_out and "<script>" not in html_out
+    converted = "<h1>" in html_out and "<li>one</li>" in html_out and "<li>two</li>" in html_out
+    return escaped and converted, f"escaped={escaped} converted={converted}"
+
+
+@check
+def export_acl_bundles_are_scoped_no_leak():
+    agg = _slice_aggregate()
+    slices = kb.derive_slices(agg, _AUDIENCES)
+    id_to_nugget = {e["id"]: _nugget_dict(id=e["id"], title=e["id"]) for e in agg["entries"]}
+    per_audience = {}
+    for key, entries in slices.items():
+        audience = agg["repos"][key]["audience"]
+        docs_meta, files = kb._assemble_bundle(audience, entries, id_to_nugget, _NOW, "markdown")
+        per_audience[key] = ({dm["id"] for dm in docs_meta},
+                             {dm["acl"] for dm in docs_meta},
+                             set(files.keys()))
+    tech_ids, tech_acl, tech_files = per_audience["technical"]
+    allstaff_ids = per_audience["allstaff"][0]
+    ok = (tech_ids == {"a-base", "t-net"} and allstaff_ids == {"a-base"}
+          and "t-net" not in allstaff_ids and tech_acl == {"Technical"}
+          and tech_files == {"docs/a-base.md", "docs/t-net.md"})
+    return ok, f"technical={tech_ids} allstaff={allstaff_ids} acl={tech_acl}"
+
+
+@check
+def export_rendered_bundle_has_no_emdash():
+    # Build the em-dash from its code point so this source file stays em-dash-clean itself.
+    emdash = chr(0x2014)
+    md = kb._render_doc_markdown(_nugget_dict(), _NOW)
+    html_out = kb._render_doc_html(_nugget_dict(status="draft"), _NOW)
+    ok = emdash not in md and emdash not in html_out
+    return ok, f"md_clean={emdash not in md} html_clean={emdash not in html_out}"
+
+
 def main() -> int:
     failures = 0
     for fn in CHECKS:
