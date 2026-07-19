@@ -387,11 +387,14 @@ class FakeAsanaClient:
 
     def put(self, path, body):
         self.writes.append(("PUT", path, dict(body)))
-        if path.startswith("/tasks/") and "completed" in body:
+        if path.startswith("/tasks/"):
             gid = path.split("/")[2]
             for t in self._tasks:
                 if t.get("gid") == gid:
-                    t["completed"] = body["completed"]
+                    if "completed" in body:
+                        t["completed"] = body["completed"]
+                    if "notes" in body:
+                        t["notes"] = body["notes"]
         return {"data": {}}
 
 
@@ -496,6 +499,95 @@ def reconcile_dry_run_makes_zero_writes():
                 _finding("KB-ROT-TRIVIAL", "nug-2", entity="Owner A", owner_gid="111")]
     counts = kb._reconcile(fake, _cfg(), findings, {"KB-GAP", "KB-CONFLICT", "KB-ROT-TRIVIAL"}, False)
     ok = counts["created"] == 2 and fake.writes == []
+    return ok, f"counts={counts} writes={fake.writes}"
+
+
+@check
+def finding_notes_body_has_four_sections():
+    # Every emitted task must carry a complete, self-contained notes body (feedback_asana_task_completeness):
+    # Background + Evidence + Expected action + How it clears, for every owned family (GAP, CONFLICT, ROT).
+    cases = [
+        _finding("KB-ROT-REDUNDANT", "seed-inventory-worklog", entity="Owner A", detail="Redundant (status retired)"),
+        _finding("KB-GAP", "reset the vpn", detail="3 miss(es) logged, no matching nugget"),
+        _finding("KB-CONFLICT", "nug-a|nug-b", detail="2 logged tie(s) for query 'x'; cited nug-a, nug-b"),
+    ]
+    headers = ("Background", "Evidence", "Expected action", "How it clears")
+    ok = True
+    detail = ""
+    for f in cases:
+        body = kb._finding_notes(f)
+        has_headers = all(h in body for h in headers)
+        # Background names the raising tool; Evidence carries the subject + observed value; How-it-clears names
+        # the re-discovery close so the assignee never hand-closes.
+        grounded = ("kb.py" in body and kb._finding_subject(f) in body and f["detail"] in body
+                    and "verified-clear" in body and "Do not close it by hand" in body)
+        if not (has_headers and grounded):
+            ok = False
+            detail = f"{f['finding_id']} headers={has_headers} grounded={grounded}\n---\n{body}"
+            break
+    return ok, detail
+
+
+@check
+def create_task_body_carries_complete_notes():
+    # The create path (not just the helper) must POST the complete body, in place of the old one-line detail.
+    fake = FakeAsanaClient(sections=list(_KB_SECTION))
+    f = _finding("KB-ROT-REDUNDANT", "seed-inventory-worklog", entity="Owner A", owner_gid="111",
+                 detail="Redundant (status retired)")
+    kb._reconcile(fake, _cfg(), [f], {"KB-ROT-REDUNDANT"}, True)
+    create = next((w for w in fake.writes if w[0] == "POST" and w[1] == "/tasks"), None)
+    notes = (create[2].get("notes") if create else "") or ""
+    ok = (create is not None
+          and all(h in notes for h in ("Background", "Evidence", "Expected action", "How it clears"))
+          and notes == kb._finding_notes(f))       # exactly the compliant body, nothing thinner
+    return ok, f"notes={notes!r}"
+
+
+@check
+def backfill_notes_heals_thin_task_idempotently():
+    # A task created before the complete-notes rule carries a thin body. --backfill-notes heals it to the
+    # compliant body with exactly one notes PUT; a second run writes nothing (idempotent).
+    f = _finding("KB-ROT-REDUNDANT", "seed-inventory-worklog", entity="Owner A", owner_gid="111",
+                 detail="Redundant (status retired)")
+    title = kb._finding_title(f)
+    fake = FakeAsanaClient(sections=list(_KB_SECTION),
+                           tasks=[{"gid": "T1", "name": title, "completed": False,
+                                   "notes": "Redundant (status retired)"}])
+    counts = kb._reconcile(fake, _cfg(), [f], {"KB-ROT-REDUNDANT"}, True, backfill_notes=True)
+    notes_puts = [w for w in fake.writes if w[0] == "PUT" and w[1] == "/tasks/T1" and "notes" in w[2]]
+    healed = notes_puts and notes_puts[0][2]["notes"] == kb._finding_notes(f)
+    # Idempotent re-run: notes now match, so zero writes.
+    fake2 = FakeAsanaClient(sections=list(_KB_SECTION),
+                            tasks=[{"gid": "T1", "name": title, "completed": False,
+                                    "notes": kb._finding_notes(f)}])
+    counts2 = kb._reconcile(fake2, _cfg(), [f], {"KB-ROT-REDUNDANT"}, True, backfill_notes=True)
+    ok = (counts["notes_updated"] == 1 and len(notes_puts) == 1 and healed
+          and counts2["notes_updated"] == 0 and fake2.writes == [])
+    return ok, f"counts={counts} counts2={counts2} writes2={fake2.writes}"
+
+
+@check
+def backfill_notes_off_by_default_keeps_steady_state():
+    # Without --backfill-notes a normal reconcile must NOT rewrite a matching task's notes, even a thin one:
+    # the audit family's steady-state run writes nothing.
+    f = _finding("KB-GAP", "reset vpn", detail="1 miss(es) logged, no matching nugget")
+    title = kb._finding_title(f)
+    fake = FakeAsanaClient(sections=list(_KB_SECTION),
+                           tasks=[{"gid": "T1", "name": title, "completed": False, "notes": "thin"}])
+    counts = kb._reconcile(fake, _cfg(), [f], {"KB-GAP", "KB-CONFLICT"}, True)  # backfill_notes defaults False
+    ok = counts["noop"] == 1 and counts["notes_updated"] == 0 and fake.writes == []
+    return ok, f"counts={counts} writes={fake.writes}"
+
+
+@check
+def backfill_notes_dry_run_previews_without_writing():
+    # A --backfill-notes preview (commit=False) reads live tasks and reports notes_updated, but writes nothing.
+    f = _finding("KB-ROT-TRIVIAL", "nug-2", entity="Owner A", owner_gid="111", detail="Trivial (near-empty body)")
+    title = kb._finding_title(f)
+    fake = FakeAsanaClient(sections=list(_KB_SECTION),
+                           tasks=[{"gid": "T1", "name": title, "completed": False, "notes": "thin"}])
+    counts = kb._reconcile(fake, _cfg(), [f], {"KB-ROT-TRIVIAL"}, False, backfill_notes=True)
+    ok = counts["notes_updated"] == 1 and fake.writes == []
     return ok, f"counts={counts} writes={fake.writes}"
 
 
