@@ -978,6 +978,87 @@ def _finding_id_from_title(name: str) -> str | None:
     return m.group(1) if m else None
 
 
+# Per-finding-id Background (the condition that tripped) and Expected action (the remediation), for the Asana
+# notes body. Every KB task must carry a complete, self-contained notes body built BEFORE the POST
+# (feedback_asana_task_completeness): a bare `[<id>] <subject>` title plus a one-line reason is a defect. The
+# assignee opens the task cold and must understand, without asking, where it came from and what to do. Keep
+# these deterministic (no clock, no run-specific state) so a re-create or backfill of the same finding yields a
+# byte-identical body.
+_FINDING_BACKGROUND = {
+    _GAP_ID: "flagged as a knowledge Gap: one or more logged reader queries found no matching nugget, so the "
+             "KB could not answer.",
+    _CONFLICT_ID: "flagged as a Conflict: a logged query matched several nuggets that were cited together as "
+                  "a tie, so the KB could not resolve to a single answer.",
+    _ROT_IDS["Outdated"]: "flagged Outdated: its `verified` date is missing or older than the freshness "
+                          "window, so the fact it holds may no longer be current.",
+    _ROT_IDS["Redundant"]: "flagged Redundant: it duplicates an id, shares a source, is superseded by, or "
+                           "carries a retired/archived status relative to another nugget.",
+    _ROT_IDS["Trivial"]: "flagged Trivial: its body is near-empty, so it may hold no fact worth keeping.",
+}
+_FINDING_ACTION = {
+    _GAP_ID: "Author a nugget that answers this query and store it through the gate (a reference or a named "
+             "attestation is required), or dismiss this task if the query is out of scope or a false positive.",
+    _CONFLICT_ID: "Reconcile the cited nuggets so one answers the query (retire or merge the duplicates, or "
+                  "mark the authoritative one), or dismiss this task if the tie is acceptable.",
+    _ROT_IDS["Outdated"]: "Re-verify the nugget and refresh its `verified` date, or retire it if it is no "
+                          "longer accurate. Dismiss this task if the freshness flag is wrong.",
+    _ROT_IDS["Redundant"]: "Retire, merge, or repoint the nugget so a single source of truth remains (resolve "
+                           "the duplicate id, shared source, supersession, or retired status). Dismiss this "
+                           "task if the flag is wrong.",
+    _ROT_IDS["Trivial"]: "Expand the nugget with substantive content, or retire it if it holds no fact worth "
+                         "keeping. Dismiss this task if the body is intentionally short and the owner confirms.",
+}
+# The close mechanism is identical for every KB finding: the audit family lets re-discovery be the judge of
+# "done" (kacific-audit-governance), so a task is never hand-closed.
+_FINDING_CLEARS = (
+    "This task closes itself. The next `kb.py feedback` run re-discovers the finding set; once this condition "
+    "is gone from live state the task is completed as verified-clear. Do not close it by hand: a task closed "
+    "while its condition still exists on live state is reopened as verification-failed on the next run."
+)
+
+
+def _finding_evidence(finding: dict) -> str:
+    """The Evidence block: the specific subject, the owner (for a ROT nugget), and the observed value/source
+    the flag was read from. Labelled per family so the subject reads correctly (a query, cited ids, or a
+    nugget id)."""
+    fid = finding["finding_id"]
+    subject = _finding_subject(finding)
+    detail = str(finding.get("detail") or "").strip()
+    lines: list[str] = []
+    if fid == _GAP_ID:
+        lines.append(f"Query: {subject}")
+    elif fid == _CONFLICT_ID:
+        lines.append(f"Cited nuggets: {subject}")
+    else:  # a ROT finding: the subject is the nugget id, and entity is its owner
+        lines.append(f"Nugget: {subject}")
+        owner = str(finding.get("entity") or "").strip()
+        if owner and owner != _TRIAGE:
+            lines.append(f"Owner: {owner}")
+    if detail:
+        lines.append(f"Observed: {detail}")
+    return "\n".join(lines)
+
+
+def _finding_notes(finding: dict) -> str:
+    """The complete, self-contained Asana notes body for one KB finding, built BEFORE the POST
+    (feedback_asana_task_completeness). Four sections in order: Background (which audit raised it + the
+    condition that tripped), Evidence (subject, owner, observed value/source), Expected action (remediation +
+    dismiss path), and How it clears (re-discovery auto-closes it; never hand-close). Covers GAP, CONFLICT and
+    the three ROT ids; an unknown id degrades to a generic background/action rather than an empty body.
+    Deterministic (no clock, no run-specific state), so a steady-state re-create or backfill is byte-stable."""
+    fid = finding["finding_id"]
+    background = _FINDING_BACKGROUND.get(fid, "flagged by the KB health audit.")
+    action = _FINDING_ACTION.get(
+        fid, "Review the finding and remediate the nugget, or dismiss this task if the flag is wrong.")
+    return (
+        f"Background\n"
+        f"Raised by the KB health audit (kb.py). This finding is {background}\n\n"
+        f"Evidence\n{_finding_evidence(finding)}\n\n"
+        f"Expected action\n{action}\n\n"
+        f"How it clears\n{_FINDING_CLEARS}"
+    )
+
+
 def _active_ids(log_collected: bool, rot_collected: bool) -> set:
     """The finding-id families whose surface was actually collected this run (the active-family gate). The
     verify-clear/reopen pass may only act on a task whose id is in this set; a family whose surface was NOT
@@ -1266,14 +1347,17 @@ def _ensure_verification_field(client, workspace_gid: str, project_gid: str, fie
 
 
 def _existing_kb_tasks(client, section_gid: str) -> dict:
-    """Owned tasks currently in the KB section, {title: {gid, completed}}. Section-scoped and OWNED_RE-filtered,
-    so [Build]/[Chip] tasks (in the project's default section) are never even seen. No `completed_since` is
-    passed, so completed tasks ARE returned and reopen can fire on a human-closed KB task."""
+    """Owned tasks currently in the KB section, {title: {gid, completed, notes}}. Section-scoped and
+    OWNED_RE-filtered, so [Build]/[Chip] tasks (in the project's default section) are never even seen. No
+    `completed_since` is passed, so completed tasks ARE returned and reopen can fire on a human-closed KB task.
+    `notes` is read so the backfill can compare a task's live body against the compliant one and heal it only
+    when it differs (idempotent)."""
     out: dict = {}
-    for t in client.get_all(f"/sections/{section_gid}/tasks", {"opt_fields": "name,completed"}):
+    for t in client.get_all(f"/sections/{section_gid}/tasks", {"opt_fields": "name,completed,notes"}):
         name = t.get("name", "")
         if _finding_id_from_title(name):
-            out[name] = {"gid": t.get("gid"), "completed": bool(t.get("completed"))}
+            out[name] = {"gid": t.get("gid"), "completed": bool(t.get("completed")),
+                         "notes": t.get("notes") or ""}
     return out
 
 
@@ -1305,7 +1389,7 @@ def _create_task(client, cfg: dict, section_gid: str | None, finding: dict, vfie
     default_assignee = str(tracking.get("default_assignee") or "").strip()
     owner_gid = finding.get("owner_gid")
     assignee = str(owner_gid).strip() if owner_gid else default_assignee
-    body = {"name": _finding_title(finding), "notes": finding.get("detail", ""), "projects": [project_gid]}
+    body = {"name": _finding_title(finding), "notes": _finding_notes(finding), "projects": [project_gid]}
     if assignee:
         body["assignee"] = assignee
     try:
@@ -1328,6 +1412,24 @@ def _create_task(client, cfg: dict, section_gid: str | None, finding: dict, vfie
             pass  # landed in the project's default section; not fatal
     _apply_verification(client, task_gid, "unverified", vfield, commit)
     counts["created"] += 1
+
+
+def _backfill_task_notes(client, task: dict, finding: dict, commit: bool, counts: dict) -> None:
+    """Heal one existing owned task's notes to the compliant body when they differ (idempotent). Used by the
+    `--backfill-notes` path so tasks created before the complete-notes rule (or by an older tool version) get
+    a full Background/Evidence/Expected action/How it clears body, without touching any foreign task. A no-op
+    when the notes already match, so a re-run writes nothing; commit-gated, but the count is reported on the
+    dry-run so the write can be reviewed first."""
+    desired_notes = _finding_notes(finding)
+    if (task.get("notes") or "") == desired_notes:
+        return
+    counts["notes_updated"] += 1
+    if not commit:
+        return
+    try:
+        client.put(f"/tasks/{task['gid']}", {"notes": desired_notes})
+    except _AsanaError:
+        counts["failed"] += 1
 
 
 def _reorder_section_by_entity(client, section_gid: str, findings: list, counts: dict) -> None:
@@ -1353,11 +1455,16 @@ def _reorder_section_by_entity(client, section_gid: str, findings: list, counts:
     counts["reordered"] += 1
 
 
-def _reconcile(client, cfg: dict, findings: list, active_ids: set, commit: bool) -> dict:
+def _reconcile(client, cfg: dict, findings: list, active_ids: set, commit: bool,
+               backfill_notes: bool = False) -> dict:
     """The audit-family reconcile: create / no-op / verify-clear / reopen the tool's own `[KB-*]` tasks in the
     KB section, gated by the active-family set. Re-discovery is the judge of "done": a finding still present
     keeps (or reopens) its task; a finding absent from the freshly-computed set (its family collected)
-    verify-clears its task; a family NOT collected this run is left untouched."""
+    verify-clears its task; a family NOT collected this run is left untouched.
+
+    `backfill_notes` additionally heals the notes body of an existing owned task whose finding is still present,
+    so tasks created before the complete-notes rule get a compliant body. It is idempotent (writes only when
+    the notes differ) and opt-in, so a normal reconcile keeps its steady-state zero-write profile."""
     tracking = cfg.get("tracking", {}) or {}
     project_gid = str(tracking.get("project_gid") or "").strip()
     workspace_gid = str(tracking.get("workspace_gid") or "").strip()
@@ -1367,7 +1474,7 @@ def _reconcile(client, cfg: dict, findings: list, active_ids: set, commit: bool)
         raise SystemExit("reconcile needs [tracking].project_gid in config.toml")
 
     counts = {"created": 0, "noop": 0, "reopened": 0, "verify_cleared": 0,
-              "skipped_inactive": 0, "reordered": 0, "failed": 0}
+              "skipped_inactive": 0, "reordered": 0, "notes_updated": 0, "failed": 0}
 
     section_gid = _ensure_kb_section(client, project_gid, section_name, commit)
     vfield = _ensure_verification_field(client, workspace_gid, project_gid, field_name, commit)
@@ -1392,8 +1499,12 @@ def _reconcile(client, cfg: dict, findings: list, active_ids: set, commit: bool)
                     counts["failed"] += 1
                     continue
                 _apply_verification(client, task["gid"], "verification-failed", vfield, commit)
+            if backfill_notes:
+                _backfill_task_notes(client, task, finding, commit, counts)
             counts["reopened"] += 1
         else:
+            if backfill_notes:
+                _backfill_task_notes(client, task, finding, commit, counts)
             counts["noop"] += 1
 
     # Pass B: verify-clear an owned task whose condition is gone, but only for a family that was collected.
@@ -1502,21 +1613,28 @@ def cmd_feedback(args) -> int:
             line += " " + " ".join(f"[{n}]" for n in notes)
         print(line)
 
-    if not args.commit:
+    backfill_notes = getattr(args, "backfill_notes", False)
+
+    # A plain dry-run stays fully offline (no PAT): it has already printed the plan above. A --backfill-notes
+    # dry-run is the exception: previewing which task bodies would change needs to READ the live tasks, so it
+    # resolves the PAT and runs the reconcile read-only (commit=False -> GETs only, zero writes) to report the
+    # notes_updated count before a committing run applies it.
+    if not args.commit and not backfill_notes:
         return 0
 
     # Live reconcile. Even with zero findings this must run, so a condition that has cleared (its family
-    # collected) gets its task verify-cleared. The PAT is resolved here, never on the dry-run path.
+    # collected) gets its task verify-cleared. The PAT is resolved here, never on the plain-dry-run path.
     config = load_config(args.config)
     pat = _resolve_tracking_pat(config)
     client = _AsanaClient(pat)
     active_ids = _active_ids(log_collected, rot_collected)
     try:
-        counts = _reconcile(client, config, findings, active_ids, True)
+        counts = _reconcile(client, config, findings, active_ids, args.commit, backfill_notes=backfill_notes)
     except _AsanaError as exc:
         print(f"feedback: Asana reconcile failed: {exc}", file=sys.stderr)
         return 1
-    print("reconcile: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+    mode = "reconcile" if args.commit else "reconcile (read-only preview)"
+    print(f"{mode}: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
     return 0
 
 
@@ -2173,6 +2291,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="reconcile the finding set into Asana (create/no-op/verify-clear/reopen); "
                          "default is an offline dry-run that only prints the plan")
     sp.add_argument("--config", default="config.toml", help="path to config.toml (used with --commit)")
+    sp.add_argument("--backfill-notes", action="store_true",
+                    help="heal existing owned KB tasks' notes to the complete Background/Evidence/Expected "
+                         "action/How-it-clears body (idempotent). Reads the tracking PAT even without --commit "
+                         "to preview the count; add --commit to apply the writes")
     sp.set_defaults(func=cmd_feedback)
 
     sp = sub.add_parser("prescan",
