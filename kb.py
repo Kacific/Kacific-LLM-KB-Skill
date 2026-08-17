@@ -47,6 +47,13 @@ VALID_TYPES = {"how-to", "troubleshooting", "faq", "known-issue", "reference", "
 VALID_STATUS = {"draft", "published", "needs-update", "archived", "retired"}
 ROT_OUTDATED_DAYS = 30
 READER_STALE_DAYS = 90
+# A nugget cited by a real query within USAGE_WINDOW_DAYS is "in active use", so its ROT-OUTDATED flag is
+# held back: chasing a re-verification nobody is waiting on is what turned a batch of seeded nuggets into 108
+# same-day findings. The hold is not unconditional though: past ROT_HARD_CEILING_DAYS the nugget is flagged
+# regardless of use, so a popular-but-wrong fact still resurfaces for a human re-check. `verified` itself is
+# never touched by use; usage only extends the window, it is not a substitute for human verification.
+USAGE_WINDOW_DAYS = 90
+ROT_HARD_CEILING_DAYS = 180
 TRIVIAL_BODY_CHARS = 40  # only near-empty stubs; a normal short nugget is legitimate, not trivial
 MISS_RESPONSE = "I cannot find this information in the current knowledge base."
 
@@ -365,8 +372,9 @@ def _load_nuggets(root: Path) -> list[dict]:
     return nuggets
 
 
-def _registry_entry(n: dict) -> dict:
+def _registry_entry(n: dict, last_used_map: dict | None = None) -> dict:
     m = n["meta"]
+    last_used = (last_used_map or {}).get(m["id"])
     return {
         "id": m["id"],
         "title": m.get("title", ""),
@@ -378,6 +386,10 @@ def _registry_entry(n: dict) -> dict:
         "source_document": m.get("source"),
         "confidence_score": m.get("confidence"),
         "last_verified": m.get("verified"),
+        # Derived, additive, manager-owned: most recent real usage (from the interaction log), null until any
+        # usage is seen. Carries the "in active use" signal to the rot sweep across hosts via the registry;
+        # never a substitute for `last_verified`, which stays a human-only field.
+        "last_used": last_used.strftime("%Y-%m-%dT%H:%M:%SZ") if last_used else None,
         "path": str(n["path"]),
         "content_hash": body_hash(n["body"]),
     }
@@ -644,7 +656,8 @@ def cmd_index(args) -> int:
         print("index: give a repo path, or --manifest to build the cross-repo aggregate.", file=sys.stderr)
         return 2
     root = Path(args.repo)
-    entries = [_registry_entry(n) for n in _load_nuggets(root)]
+    last_used = _last_used_from_logfile(getattr(args, "log_file", None))
+    entries = [_registry_entry(n, last_used) for n in _load_nuggets(root)]
     out = {"schema_version": SCHEMA_VERSION, "generated_utc": _now_iso(), "entries": entries}
     payload = json.dumps(out, indent=2)
     if args.out:
@@ -740,11 +753,48 @@ def cmd_answer(args) -> int:
     return 0
 
 
-def _rot_flags(nuggets: list[dict], now: datetime) -> list[dict]:
+def _last_used_map(records: list[dict]) -> dict:
+    """Map nugget id -> most recent usage datetime, from interaction-log records.
+
+    A nugget is "used" when it is cited in a hit answer (`_log_interaction` writes {ts, hit, cited}). The
+    ROT-OUTDATED rule reads this so an in-use, still-under-ceiling nugget is left alone instead of raising a
+    re-verification task nobody is waiting on. Non-hit or malformed records are ignored; a missing ts skips.
+    """
+    used: dict = {}
+    for r in records:
+        if not r.get("hit"):
+            continue
+        ts = _parse_iso_utc(r.get("ts"))
+        if ts is None:
+            continue
+        for nid in r.get("cited") or []:
+            prev = used.get(nid)
+            if prev is None or ts > prev:
+                used[nid] = ts
+    return used
+
+
+def _last_used_from_logfile(log_file) -> dict:
+    """Build the last_used map from an optional interaction-log PATH, or {} when absent/uncollectable.
+
+    A convenience over `_read_interaction_log` + `_last_used_map` for the `rot` and single-repo `index`
+    callers, which take a `--log-file` path rather than records already in hand (as `feedback` does).
+    """
+    if not log_file:
+        return {}
+    records, collected = _read_interaction_log(Path(log_file))
+    return _last_used_map(records) if collected else {}
+
+
+def _rot_flags(nuggets: list[dict], now: datetime, last_used_map: dict | None = None) -> list[dict]:
     """Compute the Redundant / Outdated / Trivial flags for a nugget set. The single source of the ROT rules.
 
     Both `rot` (which reports them, grouped by owner) and `feedback` (which turns them into audit-family
     findings) call this, so the flag rules live in exactly one place. Each flag is {id, path, owner, reasons}.
+
+    `last_used_map` (nugget id -> last-used datetime, from `_last_used_map`) softens the Outdated rule: a
+    nugget in active use inside USAGE_WINDOW_DAYS is not flagged Outdated until it also crosses
+    ROT_HARD_CEILING_DAYS. An empty or absent map reproduces the pre-usage behaviour exactly.
     """
     by_id: dict = {}
     by_source: dict = {}
@@ -763,9 +813,14 @@ def _rot_flags(nuggets: list[dict], now: datetime) -> list[dict]:
         reasons = []
         verified = _iso_date(m.get("verified"))
         if verified is None:
+            # A never-verified nugget has had no human confirmation at all; use never excuses it.
             reasons.append("Outdated (never verified)")
         elif (now - verified).days > ROT_OUTDATED_DAYS:
-            reasons.append(f"Outdated (verified {(now - verified).days} days ago)")
+            age = (now - verified).days
+            last_used = (last_used_map or {}).get(m["id"])
+            used_recently = last_used is not None and (now - last_used).days <= USAGE_WINDOW_DAYS
+            if not (used_recently and age <= ROT_HARD_CEILING_DAYS):
+                reasons.append(f"Outdated (verified {age} days ago)")
         if len(by_id[m["id"]]) > 1:
             reasons.append("Redundant (duplicate id)")
         if m.get("source") and len(by_source[m["source"]]) > 1:
@@ -790,7 +845,8 @@ def _rot_flags(nuggets: list[dict], now: datetime) -> list[dict]:
 
 def cmd_rot(args) -> int:
     nuggets = _load_nuggets(Path(args.repo))
-    flags = _rot_flags(nuggets, datetime.now(timezone.utc))
+    last_used = _last_used_from_logfile(getattr(args, "log_file", None))
+    flags = _rot_flags(nuggets, datetime.now(timezone.utc), last_used)
 
     if not flags:
         print(f"rot: clean. {len(nuggets)} nuggets, none flagged.")
@@ -1578,7 +1634,11 @@ def cmd_feedback(args) -> int:
             nuggets = []
         if nuggets:
             rot_collected = True
-            findings.extend(_rot_findings(_rot_flags(nuggets, datetime.now(timezone.utc))))
+            # Usage softens the Outdated flag: a nugget cited by a recent hit answer is left alone until the
+            # hard ceiling. The signal comes from the same interaction log this sweep already read; if the log
+            # was not collected the map is empty and the rule behaves exactly as before.
+            last_used = _last_used_map(records) if log_collected else {}
+            findings.extend(_rot_findings(_rot_flags(nuggets, datetime.now(timezone.utc), last_used)))
         else:
             # A mis-pointed or empty --repo reads identically to "collected, found nothing", which would let
             # the reconcile auto-clear every ROT task. Treat zero nuggets as NOT collected (the active-family
@@ -2251,6 +2311,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--publish", action="store_true",
                     help="with --manifest, commit+push each changed audience slice into its data repo "
                          "(a dev-Mac write step; needs write access, so the read-only cron never passes it)")
+    sp.add_argument("--log-file",
+                    help="single-repo index only: interaction log to stamp each entry's derived last_used "
+                         "(omit to leave last_used null)")
     sp.set_defaults(func=cmd_index)
 
     sp = sub.add_parser("answer", help="answer a query from stored nuggets")
@@ -2262,6 +2325,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("rot", help="hygiene sweep")
     sp.add_argument("--repo", default=".", help="KB repo root to sweep (default: current dir)")
+    sp.add_argument("--log-file",
+                    help="interaction log to read usage from; a nugget cited by a recent hit answer is held "
+                         "back from the Outdated flag until the hard ceiling (omit to disable usage softening)")
     sp.set_defaults(func=cmd_rot)
 
     sp = sub.add_parser("sync", help="drift-detect managed repos against the recorded aggregate")
