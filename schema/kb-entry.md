@@ -86,6 +86,12 @@ The manager computes, per nugget, a content hash (over the body only, excluding 
 as `verified`, so the manager's own writes never look like drift), the source repo, and the last-seen commit
 SHA. These live in the registry, not in the nugget frontmatter.
 
+`last_used` is another derived, registry-only field: the most recent time a real query cited the nugget in a
+hit answer (from the interaction log), or `null` until any usage is seen. It carries the "in active use"
+signal to the hygiene sweep, which holds back the Outdated flag for a nugget used inside the usage window
+until a hard ceiling age. It is never a substitute for `verified`: usage is not human confirmation, so
+`verified` stays a human-only field and a nugget past the ceiling is flagged regardless of use.
+
 Each data repo's published `registry.json` is its **audience slice**, not a self-only listing: the manager
 derives it from the private cross-audience aggregate per the manifest `[audiences]` map, so a repo carries the
 all-staff base plus its own area (for example Technical = AllStaff + Technical) and never any entry a lower-

@@ -16,7 +16,7 @@ import json
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -224,6 +224,110 @@ def rot_clean_on_fresh_repo():
         p = run("rot", "--repo", d)
     ok = p.returncode == 0 and "rot: clean" in p.stdout
     return ok, f"rc={p.returncode} stdout={p.stdout.strip()!r}"
+
+
+@check
+def last_used_map_takes_latest_hit_only():
+    # Per-nugget last_used is the latest ts across HIT records citing it; misses and bad/absent ts are ignored.
+    recs = [
+        {"ts": "2026-01-01T00:00:00Z", "hit": True, "cited": ["x"]},
+        {"ts": "2026-03-01T00:00:00Z", "hit": True, "cited": ["x", "y"]},
+        {"ts": "2026-06-01T00:00:00Z", "hit": False, "cited": ["x"]},  # a miss is not usage
+        {"ts": "not-a-date", "hit": True, "cited": ["z"]},             # unparseable ts skipped
+        {"hit": True, "cited": ["w"]},                                 # missing ts skipped
+    ]
+    m = kb._last_used_map(recs)
+    ok = (m.get("x") == kb._parse_iso_utc("2026-03-01T00:00:00Z")
+          and m.get("y") == kb._parse_iso_utc("2026-03-01T00:00:00Z")
+          and "z" not in m and "w" not in m)
+    return ok, f"keys={sorted(m)} x={m.get('x')}"
+
+
+@check
+def rot_last_used_extends_and_ceiling():
+    # The Outdated rule: a nugget verified past the window is left alone only while it is in active use AND
+    # under the hard ceiling. Never-verified and past-ceiling are flagged regardless of use.
+    now = _NOW
+
+    def nug(nid, days_verified):
+        v = "unverified" if days_verified is None else (now - timedelta(days=days_verified)).strftime("%Y-%m-%d")
+        return _nugget_dict(id=nid, verified=v)
+
+    nuggets = [
+        nug("used-fresh", 60),          # verified 60d, used 5d ago -> NOT flagged (in use, under ceiling)
+        nug("used-stale-usage", 60),    # verified 60d, last used 200d ago -> flagged (not in use)
+        nug("unused", 60),              # verified 60d, never used -> flagged
+        nug("used-over-ceiling", 200),  # verified 200d (> ceiling), used 5d ago -> flagged (over ceiling)
+        nug("never-verified", None),    # never verified, used 5d ago -> flagged (use never excuses)
+        nug("still-fresh", 10),         # verified 10d (< window), unused -> NOT flagged (still fresh)
+    ]
+    last_used = {
+        "used-fresh": now - timedelta(days=5),
+        "used-stale-usage": now - timedelta(days=200),
+        "used-over-ceiling": now - timedelta(days=5),
+        "never-verified": now - timedelta(days=5),
+    }
+    flags = kb._rot_flags(nuggets, now, last_used)
+    outdated = {f["id"] for f in flags if any(r.startswith("Outdated") for r in f["reasons"])}
+    expect = {"used-stale-usage", "unused", "used-over-ceiling", "never-verified"}
+    ok = outdated == expect
+    return ok, f"flagged={sorted(outdated)} expected={sorted(expect)}"
+
+
+@check
+def rot_empty_last_used_matches_legacy():
+    # Regression guard: no map, or an empty map, reproduces the pre-usage behaviour exactly.
+    now = _NOW
+    n = _nugget_dict(id="a", verified=(now - timedelta(days=60)).strftime("%Y-%m-%d"))
+
+    def is_out(flags):
+        return any(any(r.startswith("Outdated") for r in f["reasons"]) for f in flags)
+
+    ok = is_out(kb._rot_flags([n], now)) and is_out(kb._rot_flags([n], now, {}))
+    return ok, f"none_map_and_empty_map_both_flag={ok}"
+
+
+@check
+def feedback_usage_suppresses_outdated_under_ceiling():
+    # End-to-end through the feedback sweep: a stale-but-recently-cited nugget is held back; drop the usage
+    # record and the same nugget is flagged KB-ROT-OUTDATED.
+    now = datetime.now(timezone.utc)
+    vdate = (now - timedelta(days=60)).strftime("%Y-%m-%d")
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d) / "kb"
+        _write(repo / "shared" / "used-note.md", _nugget(id="used-note", title="Used note", verified=vdate))
+        log = Path(d) / "interactions.jsonl"
+        log.write_text(json.dumps(
+            {"ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "hit": True, "cited": ["used-note"]}) + "\n",
+            encoding="utf-8")
+        p_used = run("feedback", "--repo", str(repo), "--log-file", str(log))
+        log.write_text("", encoding="utf-8")  # collected but empty -> not in use
+        p_unused = run("feedback", "--repo", str(repo), "--log-file", str(log))
+    suppressed = p_used.returncode == 0 and "used-note" not in p_used.stdout
+    flagged = "KB-ROT-OUTDATED" in p_unused.stdout and "used-note" in p_unused.stdout
+    ok = suppressed and flagged
+    return ok, f"suppressed_when_used={suppressed} flagged_when_unused={flagged}"
+
+
+@check
+def index_stamps_last_used_from_log():
+    # Single-repo index stamps a derived last_used from the log when given one, and leaves it null otherwise.
+    now = datetime.now(timezone.utc)
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d) / "kb"
+        _write(repo / "shared" / "n1.md", _nugget(id="n1", title="N one", verified="2026-01-01"))
+        log = Path(d) / "interactions.jsonl"
+        log.write_text(json.dumps(
+            {"ts": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "hit": True, "cited": ["n1"]}) + "\n", encoding="utf-8")
+        out_with = Path(d) / "with.json"
+        run("index", str(repo), "--log-file", str(log), "--out", str(out_with))
+        out_without = Path(d) / "without.json"
+        run("index", str(repo), "--out", str(out_without))
+        e_with = json.loads(out_with.read_text())["entries"][0]
+        e_without = json.loads(out_without.read_text())["entries"][0]
+    ok = (e_with.get("last_used") is not None
+          and "last_used" in e_without and e_without.get("last_used") is None)
+    return ok, f"with={e_with.get('last_used')} without_has_null_field={'last_used' in e_without}"
 
 
 @check
