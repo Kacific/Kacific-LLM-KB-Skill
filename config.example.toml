@@ -12,6 +12,9 @@ portfolio_gid = "<portfolio-gid>"
 project_gid = "<tracking-project-gid>"
 # The section within the tracking project that KB findings tasks are filed into (find-or-created by name).
 # The tool owns only its own [KB-*] tasks there, so the section may coexist with other tasks.
+# `kb.py coordination-audit` reuses these same keys: it reads this section to judge which [KB-*] findings are
+# still open, and closes any [Build]/[Chip]/[KB] coordination task in the project whose notes open with a
+# `closes-when-cleared: <id>, <id>` anchor once none of those ids has an open task left. No extra config.
 section_name = "KB Findings"
 # Optional. Assignee GID for triage findings (gaps/conflicts) and any ROT finding whose nugget has no owner.
 # Leave empty to create those tasks unassigned.
