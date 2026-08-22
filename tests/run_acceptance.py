@@ -451,11 +451,15 @@ class FakeAsanaClient:
     """Dict-backed stand-in for kb._AsanaClient. Reads return canned fixtures; every mutating call is recorded
     in .writes as (method, path, body) so a check can assert exactly what was (or was not) written."""
 
-    def __init__(self, sections=None, tasks=None, fields=None, settings=None):
+    def __init__(self, sections=None, tasks=None, fields=None, settings=None, project_tasks=None):
         self._sections = [dict(s) for s in (sections or [])]
         self._tasks = [dict(t) for t in (tasks or [])]
         self._fields = [dict(f) for f in (fields or [])]
         self._settings = [dict(s) for s in (settings or [])]
+        # `_project_tasks` backs a whole-project read (`/projects/{gid}/tasks`) as distinct from a
+        # section-scoped read (`/sections/{gid}/tasks`); the coordination audit reads the former to see
+        # [Build]/[Chip]/[KB] tasks that never appear in the KB Findings section.
+        self._project_tasks = [dict(t) for t in (project_tasks or [])]
         self.writes = []
         self._counter = 900000
 
@@ -466,6 +470,8 @@ class FakeAsanaClient:
     def get_all(self, path, params=None):
         if path.startswith("/projects/") and path.endswith("/sections"):
             return [dict(s) for s in self._sections]
+        if path.startswith("/projects/") and path.endswith("/tasks"):
+            return [dict(t) for t in self._project_tasks]
         if "custom_field_settings" in path:
             return [dict(s) for s in self._settings]
         if "custom_fields" in path:
@@ -708,6 +714,143 @@ def reconcile_sets_enum_or_degrades_to_comment():
     commented = any(w[0] == "POST" and w[1].endswith("/stories") for w in fake_none.writes)
     ok = enum_set and commented
     return ok, f"enum_set={enum_set} commented={commented}"
+
+
+# --- coordination-audit leg (opt-in auto-close of coordination tasks) -------
+#
+# A [Build]/[Chip]/[KB] coordination task may opt into auto-close with a `closes-when-cleared:` anchor on the
+# first line of its notes. `_run_coordination_audit` closes it once its declared KB finding-ids have no OPEN
+# [KB-*] task left in the KB Findings section. Driven here with the same FakeAsanaClient; the KB findings live
+# in the section (`tasks=`), the coordination tasks in the project read (`project_tasks=`).
+
+def _kbfind(fid, subject, completed):
+    """A [KB-*] finding task fixture as it sits in the KB Findings section."""
+    return {"gid": f"F-{fid}-{subject}", "name": kb._finding_title(_finding(fid, subject)),
+            "completed": completed}
+
+
+_COORD_ZERO = {"closed": 0, "would_close": 0, "still_open": 0, "skipped": 0, "failed": 0}
+
+
+@check
+def coord_closes_when_all_tracked_findings_cleared():
+    findings = [_kbfind("KB-ROT-OUTDATED", "nug-a", True), _kbfind("KB-ROT-REDUNDANT", "nug-b", True)]
+    coord = [{"gid": "CO1", "name": "[KB] clear KB-ROT", "completed": False,
+              "notes": "closes-when-cleared: KB-ROT-OUTDATED, KB-ROT-REDUNDANT\nrest of the body"}]
+    fake = FakeAsanaClient(sections=list(_KB_SECTION), tasks=findings, project_tasks=coord)
+    counts = kb._run_coordination_audit(fake, "PROJ", "KB Findings", True)
+    closed_put = [w for w in fake.writes if w[0] == "PUT" and w[1] == "/tasks/CO1"
+                  and w[2].get("completed") is True]
+    story = [w for w in fake.writes if w[0] == "POST" and w[1] == "/tasks/CO1/stories"]
+    ok = counts["closed"] == 1 and len(closed_put) == 1 and len(story) == 1
+    return ok, f"counts={counts} writes={fake.writes}"
+
+
+@check
+def coord_leaves_open_when_a_tracked_finding_still_open():
+    findings = [_kbfind("KB-ROT-OUTDATED", "nug-a", True), _kbfind("KB-ROT-REDUNDANT", "nug-b", False)]
+    coord = [{"gid": "CO2", "name": "[KB] clear KB-ROT", "completed": False,
+              "notes": "closes-when-cleared: KB-ROT-OUTDATED, KB-ROT-REDUNDANT"}]
+    fake = FakeAsanaClient(sections=list(_KB_SECTION), tasks=findings, project_tasks=coord)
+    counts = kb._run_coordination_audit(fake, "PROJ", "KB Findings", True)
+    ok = counts["closed"] == 0 and counts["still_open"] == 1 and fake.writes == []
+    return ok, f"counts={counts} writes={fake.writes}"
+
+
+@check
+def coord_ignores_task_without_first_line_anchor():
+    # The phrase appears, but NOT on the first non-empty line, so the task is not opted in.
+    findings = [_kbfind("KB-ROT-OUTDATED", "nug-a", True)]
+    coord = [{"gid": "CO3", "name": "[Build] some feature", "completed": False,
+              "notes": "Background\ncloses-when-cleared: KB-ROT-OUTDATED"}]
+    fake = FakeAsanaClient(sections=list(_KB_SECTION), tasks=findings, project_tasks=coord)
+    counts = kb._run_coordination_audit(fake, "PROJ", "KB Findings", True)
+    ok = counts == _COORD_ZERO and fake.writes == []
+    return ok, f"counts={counts} writes={fake.writes}"
+
+
+@check
+def coord_skips_unknown_declared_id():
+    findings = [_kbfind("KB-ROT-OUTDATED", "nug-a", True)]
+    coord = [{"gid": "CO4", "name": "[KB] mistyped", "completed": False,
+              "notes": "closes-when-cleared: KB-ROT-OUTDATED, NOT-A-REAL-ID"}]
+    fake = FakeAsanaClient(sections=list(_KB_SECTION), tasks=findings, project_tasks=coord)
+    counts = kb._run_coordination_audit(fake, "PROJ", "KB Findings", True)
+    ok = counts["skipped"] == 1 and counts["closed"] == 0 and fake.writes == []
+    return ok, f"counts={counts} writes={fake.writes}"
+
+
+@check
+def coord_skips_declared_id_with_no_finding_in_section():
+    # A valid KB id, but NO finding of it exists in the section (open or closed): never close vacuously.
+    coord = [{"gid": "CO5", "name": "[KB] premature", "completed": False,
+              "notes": "closes-when-cleared: KB-ROT-OUTDATED"}]
+    fake = FakeAsanaClient(sections=list(_KB_SECTION), tasks=[], project_tasks=coord)
+    counts = kb._run_coordination_audit(fake, "PROJ", "KB Findings", True)
+    ok = counts["skipped"] == 1 and counts["closed"] == 0 and fake.writes == []
+    return ok, f"counts={counts} writes={fake.writes}"
+
+
+@check
+def coord_dry_run_makes_zero_writes():
+    findings = [_kbfind("KB-ROT-OUTDATED", "nug-a", True)]
+    coord = [{"gid": "CO6", "name": "[KB] clear", "completed": False,
+              "notes": "closes-when-cleared: KB-ROT-OUTDATED"}]
+    fake = FakeAsanaClient(sections=list(_KB_SECTION), tasks=findings, project_tasks=coord)
+    counts = kb._run_coordination_audit(fake, "PROJ", "KB Findings", False)
+    ok = counts["would_close"] == 1 and counts["closed"] == 0 and fake.writes == []
+    return ok, f"counts={counts} writes={fake.writes}"
+
+
+@check
+def coord_isolation_never_touches_kb_finding_tasks():
+    # A [KB-*] finding task also appears in the project read (findings are project members). Even if it carried
+    # an anchor, it must never be closed by this path; only the real coordination task is acted on.
+    findings = [_kbfind("KB-ROT-OUTDATED", "nug-a", True)]
+    find_in_project = {"gid": "FIND1", "name": kb._finding_title(_finding("KB-ROT-OUTDATED", "nug-a")),
+                       "completed": False, "notes": "closes-when-cleared: KB-ROT-OUTDATED"}
+    coord = [find_in_project,
+             {"gid": "CO7", "name": "[KB] clear KB-ROT", "completed": False,
+              "notes": "closes-when-cleared: KB-ROT-OUTDATED"}]
+    fake = FakeAsanaClient(sections=list(_KB_SECTION), tasks=findings, project_tasks=coord)
+    counts = kb._run_coordination_audit(fake, "PROJ", "KB Findings", True)
+    touched_find = [w for w in fake.writes if "/tasks/FIND1" in w[1]]
+    closed_coord = [w for w in fake.writes if w[0] == "PUT" and w[1] == "/tasks/CO7"]
+    ok = touched_find == [] and counts["closed"] == 1 and len(closed_coord) == 1
+    return ok, f"counts={counts} writes={fake.writes}"
+
+
+@check
+def coord_peer_already_closed_is_a_noop():
+    # Compare-and-swap: the project read saw the task open, but a peer closed it before our write (the shared
+    # asana_sc_pat makes this the normal race). The live re-GET reports it closed, so we make no write.
+    findings = [_kbfind("KB-ROT-OUTDATED", "nug-a", True)]
+    coord = [{"gid": "CO8", "name": "[KB] clear", "completed": False,
+              "notes": "closes-when-cleared: KB-ROT-OUTDATED"}]
+
+    class PeerClosed(FakeAsanaClient):
+        def get(self, path, params=None):
+            if path == "/tasks/CO8":
+                return {"data": {"completed": True}}
+            return super().get(path, params)
+
+    fake = PeerClosed(sections=list(_KB_SECTION), tasks=findings, project_tasks=coord)
+    counts = kb._run_coordination_audit(fake, "PROJ", "KB Findings", True)
+    writes_to_task = [w for w in fake.writes if w[1].startswith("/tasks/CO8")]
+    ok = counts["closed"] == 0 and writes_to_task == []
+    return ok, f"counts={counts} writes={fake.writes}"
+
+
+@check
+def coord_parse_anchor_variants():
+    # First-line only, case-insensitive key, comma and/or whitespace separated, de-duplicated.
+    p = kb._parse_closes_anchor
+    ok = (p("closes-when-cleared: KB-ROT-OUTDATED, KB-ROT-REDUNDANT") == ["KB-ROT-OUTDATED", "KB-ROT-REDUNDANT"]
+          and p("Closes-When-Cleared:  KB-GAP   KB-GAP") == ["KB-GAP"]
+          and p("Background\ncloses-when-cleared: KB-GAP") is None
+          and p("no anchor at all") is None
+          and p("") is None)
+    return ok, "anchor parse variants"
 
 
 @check

@@ -31,6 +31,15 @@ listed. Any Python 3 works: the core commands import `tomllib` lazily, so the ha
   never appearing in an error message), and the title round-trip for keys containing `] `, `|`, or an
   over-length subject.
 
+- **coordination-audit (opt-in coordination-task close)**: driven in-process against the same
+  `FakeAsanaClient` (extended with a whole-project read distinct from the section read). Covers close-when-all-
+  cleared (a PUT `completed` + an evidence comment), leave-open-when-a-tracked-finding-is-still-open (zero
+  writes), ignore-a-task-whose-anchor-is-not-on-the-first-line, skip-an-unrecognised-declared-id, skip-a-valid-
+  id-with-no-finding-in-the-section (never a vacuous close), dry-run (zero writes), isolation (a `[KB-*]`
+  finding task in the project read is never closed, even if it carries an anchor), the compare-and-swap no-op
+  when a peer closed the task first, and the anchor-parse variants (first-line-only, case-insensitive,
+  comma/whitespace separated, de-duplicated).
+
 ## Live-only checks (NUC, not in this harness)
 
 Live Asana writes cannot run in the offline harness. Run these once by hand on the NUC (Python 3.13.5) with a
@@ -42,6 +51,9 @@ real `[tracking.pat]` in `config.toml`, against the KB Findings section of the t
 - The shared `Verification` field attaches to the tracking project (or, if absent, the run degrades to a task
   comment without aborting).
 - 429 backoff is exercised opportunistically under load.
+- `kb.py coordination-audit` (no `--commit`) prints a dry-run plan and touches nothing; with `--commit` it
+  closes a coordination task carrying a `closes-when-cleared:` anchor once its declared findings have cleared,
+  and never touches a `[KB-*]` finding task.
 
 **Operational note:** the interaction log (`logs/interactions.jsonl`) must be **append-only, not rotated or
 truncated between reconcile runs**. A gap that is absent from a truncated log looks resolved and would be

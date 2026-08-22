@@ -1698,6 +1698,143 @@ def cmd_feedback(args) -> int:
     return 0
 
 
+# --- coordination-audit: close opt-in coordination tasks when their tracked findings clear ----------------
+# A coordination task ([Build]/[Chip]/[KB] in the tracking project, NOT a [KB-*] finding) may OPT IN to
+# auto-close by putting a machine-readable anchor on the FIRST non-empty line of its notes:
+#     closes-when-cleared: KB-ROT-OUTDATED, KB-ROT-REDUNDANT
+# It then closes automatically once no OPEN [KB-*] finding task carrying any of those ids remains in the KB
+# Findings section. Default (no anchor) is unchanged: coordination tasks close by human judgement on landing.
+#
+# This exists because kb.py feedback reconcile is section-scoped to KB Findings and its own [KB-*] ids by a
+# correctness invariant (_OWNED_RE), so it never sees a coordination task; wording one "awaiting auto-verify"
+# was a category error with no mechanism behind it. This subcommand is that mechanism, kept strictly separate:
+# it never routes through _reconcile, never touches a [KB-*] finding task (they carry a finding-id and are
+# excluded), never closes on an unreadable findings section or an unrecognised declared id, and re-checks
+# each task's live state immediately before writing (the shared asana_sc_pat means a peer may have closed it).
+
+_CLOSES_ANCHOR_RE = re.compile(r"^\s*closes-when-cleared:\s*(.+?)\s*$", re.IGNORECASE)
+
+
+def _parse_closes_anchor(notes: str) -> list[str] | None:
+    """The finding-id list a coordination task declares in its `closes-when-cleared:` anchor, or None when the
+    task carries no anchor. The anchor MUST be on the first non-empty line (mirroring the shepherd's
+    rootcause-key precedent), so a task that merely mentions the phrase lower in its prose is not mistaken for
+    an opt-in. Ids may be comma- and/or whitespace-separated; the list is de-duplicated, order preserved."""
+    for line in (notes or "").splitlines():
+        if not line.strip():
+            continue
+        m = _CLOSES_ANCHOR_RE.match(line)
+        if not m:
+            return None  # first non-empty line is not the anchor -> not opted in
+        seen: list[str] = []
+        for tok in m.group(1).replace(",", " ").split():
+            if tok and tok not in seen:
+                seen.append(tok)
+        return seen
+    return None
+
+
+def _run_coordination_audit(client, project_gid: str, section_name: str, commit: bool) -> dict:
+    """The core of `coordination-audit`, driven with an injected client so it is unit-testable offline exactly
+    like `_reconcile`. Reads the KB Findings section and the tracking project, closes each opted-in coordination
+    task whose declared finding-ids have no OPEN [KB-*] task left, and returns the counts. A READ failure
+    (sections / section tasks / project tasks) raises `_AsanaError` so the caller does nothing (a missed close
+    beats a false one); a per-task WRITE failure is caught and counted, never aborting the sweep."""
+    counts = {"closed": 0, "would_close": 0, "still_open": 0, "skipped": 0, "failed": 0}
+
+    section_gid = None
+    for s in client.get_all(f"/projects/{project_gid}/sections", {"opt_fields": "name"}):
+        if s.get("name") == section_name:
+            section_gid = s.get("gid")
+            break
+    if not section_gid:
+        print(f"coordination-audit: KB Findings section '{section_name}' not found; nothing to do.")
+        return counts
+    kb_tasks = _existing_kb_tasks(client, section_gid)
+    all_tasks = client.get_all(f"/projects/{project_gid}/tasks", {"opt_fields": "name,completed,notes"})
+
+    # Finding-ids that still have an OPEN [KB-*] task, and every finding-id seen at all (open or closed). A
+    # declared id absent from `seen_ids` has no finding in the section, so closing on it would be vacuous.
+    open_ids = {_finding_id_from_title(t) for t, m in kb_tasks.items() if not m["completed"]}
+    seen_ids = {_finding_id_from_title(t) for t in kb_tasks}
+    open_ids.discard(None)
+    seen_ids.discard(None)
+
+    for t in all_tasks:
+        name = t.get("name", "")
+        if t.get("completed") or _finding_id_from_title(name):
+            continue  # closed already, or a [KB-*] finding (never a coordination task)
+        declared = _parse_closes_anchor(t.get("notes") or "")
+        if declared is None:
+            continue  # not opted in
+        gid = t.get("gid")
+        unknown = [d for d in declared if d not in _OWNED_IDS]
+        if unknown:
+            print(f"coordination-audit: SKIP '{name}' - unrecognised declared id(s): {', '.join(unknown)}")
+            counts["skipped"] += 1
+            continue
+        if not any(d in seen_ids for d in declared):
+            print(f"coordination-audit: SKIP '{name}' - no finding for declared id(s) exists in "
+                  f"'{section_name}'; not closing vacuously.")
+            counts["skipped"] += 1
+            continue
+        remaining = sorted(d for d in declared if d in open_ids)
+        if remaining:
+            print(f"coordination-audit: leave open '{name}' - still-open finding id(s): {', '.join(remaining)}")
+            counts["still_open"] += 1
+            continue
+        ids_txt = ", ".join(declared)
+        if not commit:
+            print(f"coordination-audit: WOULD close '{name}' - tracked findings all clear ({ids_txt}).")
+            counts["would_close"] += 1
+            continue
+        try:
+            # Compare-and-swap: the shared asana_sc_pat means a peer may have closed it since the project read.
+            live = client.get(f"/tasks/{gid}", {"opt_fields": "completed"})
+            if (live.get("data") or {}).get("completed"):
+                print(f"coordination-audit: '{name}' already closed by a peer; skipping.")
+                continue
+            client.post(f"/tasks/{gid}/stories",
+                        {"text": f"Auto-closed by kb.py coordination-audit: every tracked finding is cleared "
+                                 f"({ids_txt}); 0 open in the {section_name} section as of {_now_iso()}. "
+                                 f"Opt-in via the closes-when-cleared anchor."})
+            client.put(f"/tasks/{gid}", {"completed": True})
+            print(f"coordination-audit: closed '{name}' ({ids_txt}).")
+            counts["closed"] += 1
+        except _AsanaError as exc:
+            print(f"coordination-audit: FAILED to close '{name}': {exc}", file=sys.stderr)
+            counts["failed"] += 1
+
+    return counts
+
+
+def cmd_coordination_audit(args) -> int:
+    """Close opt-in coordination tasks whose tracked KB findings have all cleared.
+
+    Finds non-finding coordination tasks in the tracking project carrying a `closes-when-cleared:` anchor on
+    the first line of their notes, and closes each one whose declared finding-ids no longer have any OPEN
+    [KB-*] task in the KB Findings section. Read-only unless --commit. Safe by construction: it never touches a
+    [KB-*] finding task, never closes on an unreadable findings section, never closes on an unrecognised
+    declared id or one with no finding in the section, and re-checks each task's live state before writing."""
+    config = load_config(args.config)
+    tracking = config.get("tracking", {}) or {}
+    project_gid = str(tracking.get("project_gid") or "").strip()
+    section_name = str(tracking.get("section_name") or "KB Findings").strip()
+    if not project_gid:
+        print("coordination-audit: [tracking].project_gid is required.", file=sys.stderr)
+        return 2
+
+    client = _AsanaClient(_resolve_tracking_pat(config))
+    try:
+        counts = _run_coordination_audit(client, project_gid, section_name, args.commit)
+    except _AsanaError as exc:
+        print(f"coordination-audit: read failed, doing nothing: {exc}", file=sys.stderr)
+        return 1
+    mode = "commit" if args.commit else "dry-run"
+    print(f"coordination-audit ({mode}): " + ", ".join(f"{k}={v}" for k, v in counts.items()))
+    return 0
+
+
 # --- prescan: seed-source scan -> ranked pointer candidates ------------------
 # One-time bulk seeder. Scans each [seed_sources] repo from the manifest and turns every matching file into
 # a ranked POINTER candidate (frontmatter + source + a one-line abstract, never a content copy). Report-only
@@ -2362,6 +2499,14 @@ def build_parser() -> argparse.ArgumentParser:
                          "action/How-it-clears body (idempotent). Reads the tracking PAT even without --commit "
                          "to preview the count; add --commit to apply the writes")
     sp.set_defaults(func=cmd_feedback)
+
+    sp = sub.add_parser("coordination-audit",
+                        help="close opt-in coordination tasks whose tracked KB findings have all cleared")
+    sp.add_argument("--config", default="config.toml", help="path to config.toml")
+    sp.add_argument("--commit", action="store_true",
+                    help="close the tasks in Asana; default is a read-only dry-run that prints what it "
+                         "would close")
+    sp.set_defaults(func=cmd_coordination_audit)
 
     sp = sub.add_parser("prescan",
                         help="scan the manifest's seed sources into ranked pointer candidates (secrets-safe)")
