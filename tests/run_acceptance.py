@@ -952,6 +952,73 @@ def prescan_source_url_and_dedup_norm():
     return forms and ref_free and roots and distinct, f"forms={forms} ref_free={ref_free} roots={roots} distinct={distinct}"
 
 
+@check
+def prescan_abstract_never_cuts_mid_sentence():
+    """The abstract of an over-budget paragraph is whole sentences, never a cut with a stop bolted on.
+
+    The regression case is the one that shipped: a two-sentence paragraph whose second sentence straddles
+    the budget. The old rule cut at the last word inside 200 chars, stripped the trailing punctuation and
+    appended a full stop, publishing "...read these files first rather." as a finished statement.
+    """
+    raw = ("Working knowledge base for supporting the Kacific IT team on design, planning and "
+           "configuration. This is the durable memory for the work: follow-up agents and sessions read "
+           "these files first rather than inferring an estate fact from a repository.")
+    out = kb._candidate_abstract(raw, "README.md", "shadow-it")
+    # What the old rule produced, rebuilt here so the assertion pins the DEFECT and not just today's output.
+    old = raw[:kb._ABSTRACT_MAX_CHARS].rsplit(" ", 1)[0].rstrip(" ,;:.") + "."
+    fixed = out != old and not kb._looks_truncated(out)
+    whole = out == "Working knowledge base for supporting the Kacific IT team on design, planning and configuration."
+    # The guard must be discriminating: it has to REJECT the old output, or it proves nothing.
+    catches_old = kb._looks_truncated(old)
+    return fixed and whole and catches_old, f"fixed={fixed} whole={whole} catches_old={catches_old} out={out!r}"
+
+
+@check
+def prescan_abstract_completes_only_an_uncut_line():
+    """A terminator may finish a paragraph that fitted whole; it is never bolted onto a cut one."""
+    short = "Provenance manifest for the internal guides and induction materials"
+    completed = kb._candidate_abstract(short, "SOURCE.md", "shadow-it") == short + "."
+    # Over budget with no sentence boundary anywhere: dropping to the pointer beats publishing a fragment.
+    runon = "word " * 200
+    dropped = kb._candidate_abstract(runon, "docs/notes.md", "seedkey").startswith("Pointer to docs/notes.md")
+    # Empty prose keeps the deterministic pointer line.
+    empty = kb._candidate_abstract("", "docs/empty.md", "seedkey").startswith("Pointer to docs/empty.md")
+    return completed and dropped and empty, f"completed={completed} dropped={dropped} empty={empty}"
+
+
+@check
+def prescan_looks_truncated_catches_dangling_words_not_missing_stops():
+    """The check must catch a dangling function word, since the defect always ended in a full stop."""
+    fragments = ["Sessions read these files first rather.", "One of the per-tool ops repos run by the scheduler, sibling to.",
+                 "Inspects the helpdesk board, writes a.", "The legacy Jupiter2 SRS training set. Per the.",
+                 "Harvests live configurations and aggregates them with.", "A trailing clause with no terminator"]
+    complete = ["Index of trusted sources. Cite these paths instead of relying on memory.",
+                "Internal operational tooling for the edge routers at the primary hub.",
+                "Pointer to docs/guide.md in the shadow-it seed source.",
+                "Runs on demand plus a daily cron.", "Is it reachable? Yes."]
+    missed = [f for f in fragments if not kb._looks_truncated(f)]
+    overblocked = [c for c in complete if kb._looks_truncated(c)]
+    # A terminator-only check would score every fragment above as clean; prove this one does not.
+    naive_would_pass = [f for f in fragments if f.endswith((".", "!", "?"))]
+    return not missed and not overblocked and len(naive_would_pass) >= 5, \
+        f"missed={missed} overblocked={overblocked} naive_clean={len(naive_would_pass)}"
+
+
+@check
+def prescan_sentence_split_holds_on_estate_prose():
+    """Conservative splitting: abbreviations, file extensions and version numbers are not sentence ends."""
+    cases = {
+        "Read config.example.toml first. Then run the tool.": 2,
+        "Source of truth is location_of() in assets.py; this doc is a pointer.": 1,
+        "Watermark: 2026-07-11. Status: v1, initial consolidation.": 2,
+        "Use e.g. the audit cert, not a PAT.": 1,
+        "Example Satellites Ltd. holds the licence.": 1,
+        "See ../README.md. Nothing binary is copied into git.": 2,
+    }
+    bad = {t: (len(kb._split_sentences(t)), n) for t, n in cases.items() if len(kb._split_sentences(t)) != n}
+    return not bad, f"mismatches={bad}"
+
+
 # --- audience slicing -------------------------------------------------------
 
 def _slice_aggregate() -> dict:

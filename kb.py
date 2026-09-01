@@ -1846,6 +1846,80 @@ _SECRET_EXACT = {"config.py", "config.ini", "config.toml", ".env", ".envrc"}
 _SECRET_GLOBS = ("*.pem", "*.key", "id_rsa*", "*credential*", "*secret*")
 _BOILERPLATE_STEMS = {"readme", "index", "changelog", "license", "contributing"}
 _ABSTRACT_MAX_CHARS = 200
+# A first sentence may overrun the budget up to this ceiling rather than be dropped. One dial, derived, so
+# the budget stays the only number to tune. Past the ceiling the abstract is dropped for the pointer line.
+_ABSTRACT_HARD_MAX_CHARS = 2 * _ABSTRACT_MAX_CHARS
+
+# Tokens that cannot end an English sentence. A cut abstract reads as finished because a terminator was
+# appended to it, so "does it end with a full stop" scores a fragment clean; the dangling word is the tell.
+_DANGLING_TAIL_WORDS = frozenset("""
+a an the and or but nor so yet if when while whilst because although though since unless until whether
+that which who whom whose where what how why this these those some any each every both either neither
+of to in on at by for with within without from into onto upon over under above below via per across
+against between among during before after about around through throughout toward towards than as like
+is are was were be been being am has have had do does did will would shall should can could may might
+must not no also however moreover therefore thus hence rather instead just only even still already
+its their our your his her my out up off down more most less least such one two three few many several
+""".split())
+
+_SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
+_SENTENCE_START = re.compile(r"""[A-Z0-9*`\[("'_#]""")
+# Tokens whose trailing dot is an abbreviation, not a sentence end. A single letter (an initial) too.
+_ABBREVIATIONS = frozenset("""
+e.g i.e etc vs cf approx no nos fig figs al ltd inc co corp dept est dr mr mrs ms prof jr sr st
+jan feb mar apr jun jul aug sep sept oct nov dec mon tue wed thu fri sat sun
+""".split())
+
+
+def _split_sentences(text: str) -> list:
+    """Split prose into whole sentences, conservatively: when in doubt, do NOT split.
+
+    A missed boundary only yields a shorter abstract, which is the safe direction; a wrong boundary
+    would manufacture the fragment this whole function exists to prevent. So a terminator counts only
+    when it is followed by whitespace, is not the dot of a known abbreviation or an initial, and the
+    next sentence opens the way a sentence opens (including Markdown emphasis, a code span or a link).
+    """
+    sentences: list = []
+    start = 0
+    for match in _SENTENCE_END.finditer(text):
+        i = match.start()
+        word = re.split(r"[\s(\[]", text[:i])[-1].lower().lstrip("*`\"'([")
+        if word in _ABBREVIATIONS or (len(word) == 1 and word.isalpha()):
+            continue
+        rest = text[i + 1:].lstrip()
+        if rest and not _SENTENCE_START.match(rest[0]):
+            continue
+        sentences.append(text[start:i + 1].strip())
+        start = i + 1
+    return [s for s in sentences if s]
+
+
+def _whole_sentences_within(text: str, budget: int) -> str:
+    """The longest run of whole sentences from the start of text that fits the budget. Never a fragment."""
+    kept = ""
+    for sentence in _split_sentences(text):
+        candidate = f"{kept} {sentence}".strip() if kept else sentence
+        if len(candidate) > budget:
+            break
+        kept = candidate
+    return kept
+
+
+def _looks_truncated(text: str) -> bool:
+    """True when text reads as cut mid-sentence, whatever punctuation was appended to it.
+
+    Deliberately NOT a "does it end with a terminator" check: the defect this guards against appended a
+    full stop to a fragment, so a terminator check scores it clean. The dangling function word is the
+    signal. Biased toward catching: a false positive costs one informative abstract and falls back to a
+    true pointer line, while a false negative publishes a sentence that says something the source does not.
+    """
+    stripped = str(text or "").strip()
+    if not stripped:
+        return False
+    if not stripped.endswith((".", "!", "?")):
+        return True
+    last = re.split(r"\s+", stripped.rstrip(".!?").rstrip())[-1] if stripped.rstrip(".!?").strip() else ""
+    return last.strip("*`\"')]_").lower() in _DANGLING_TAIL_WORDS
 
 
 def _is_secret_name(name: str) -> bool:
@@ -1971,13 +2045,32 @@ def _candidate_score(text: str, relpath: str, last_commit: str | None) -> tuple[
 
 
 def _candidate_abstract(raw: str, relpath: str, key: str) -> str:
-    abstract = raw
-    if len(abstract) > _ABSTRACT_MAX_CHARS:
-        abstract = abstract[:_ABSTRACT_MAX_CHARS].rsplit(" ", 1)[0].rstrip(" ,;:.") + "."
-    if not abstract:
-        abstract = f"Pointer to {relpath} in the {key} seed source."
-    if not abstract.endswith((".", "!", "?")):
-        abstract += "."
+    """A one-line abstract that is always a COMPLETE statement, never a cut one.
+
+    An abstract is published prose that a reader takes as true. A budget-cut of the source paragraph is
+    not a shorter version of what the source says, it is a different and often false statement: cutting
+    immediately before a status line publishes a resolved item as open. So the budget selects whole
+    sentences, and where not even one fits, a shorter true line is preferred to a longer broken one.
+
+    A terminator is completed only when nothing was cut, since finishing an uncut line adds no claim.
+    It is NEVER appended to a cut, which is what made the old defect invisible: the body ended in a full
+    stop and read finished.
+    """
+    raw = str(raw or "").strip()
+    pointer = f"Pointer to {relpath} in the {key} seed source."
+    if not raw:
+        abstract = pointer
+    elif len(raw) <= _ABSTRACT_MAX_CHARS:
+        # Nothing is cut, so completing the sentence claims no more than the source paragraph did.
+        abstract = raw if raw.endswith((".", "!", "?")) else raw + "."
+    else:
+        abstract = _whole_sentences_within(raw, _ABSTRACT_MAX_CHARS)
+        if not abstract:
+            # No whole sentence fits. Keep the first one if it merely overruns; drop it if it is far over.
+            first = next(iter(_split_sentences(raw)), "")
+            abstract = first if 0 < len(first) <= _ABSTRACT_HARD_MAX_CHARS else pointer
+    if _looks_truncated(abstract):  # fail safe: never publish a fragment, whatever produced it
+        abstract = pointer
     if len(abstract) < TRIVIAL_BODY_CHARS:  # keep a fresh candidate out of the rot sweep's trivial flag
         abstract += " See the source document for the full detail."
     return abstract
