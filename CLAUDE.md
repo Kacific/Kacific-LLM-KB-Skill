@@ -12,14 +12,23 @@ files or moving branches at any moment. The rules below exist because a shared c
 shuffle a branch ref mid-commit.
 
 - **Worktree-per-session (mandatory).** Never edit in a shared main checkout. Create your own linked
-  worktree and work there:
+  worktree **under the repo**, at a gitignored path, and work there:
   ```
   git -C <repo> fetch --prune origin main
-  git -C <repo> worktree add ../wt-<task> -b <area>/<task> origin/main
-  # edit in ../wt-<task>, commit, push, open the PR, then:
-  git -C <repo> worktree remove ../wt-<task>
+  git -C <repo> worktree add .claude/worktrees/<task> -b <area>/<task> origin/main
+  # edit in that worktree, commit, push, open the PR, then:
+  git -C <repo> worktree remove .claude/worktrees/<task>
   ```
   A worktree has its own HEAD and index, so a peer's checkout cannot move your branch under you.
+  **Place it under the repo, never beside it as `../wt-<task>`.** A sibling inherits the PARENT
+  directory's treatment rather than the repo's, so it silently escapes every protection scoped to the
+  repo path at once: backup roots and sync excludes that name the repo, ignore rules, and anything else
+  keyed on that path. This is not hypothetical, it cost a live incident. Under the repo it inherits all
+  of them, and being gitignored keeps it out of the index. Full reasoning in the `using-git-worktrees`
+  and `multi-agent-repo-coordination` vault skills.
+  **This repo's tracked `.gitignore` must carry `.claude/worktrees/`.** A local `.git/info/exclude` entry
+  is not enough: it never travels, so on a fresh clone the worktree shows as untracked and a nested
+  working copy can be committed by accident. Add the line if it is missing.
 - **Pull before dev.** `fetch --prune` then `pull --ff-only` (or branch straight off `origin/main`)
   before the first edit. Fast-forward only, never force. If `--ff-only` refuses (diverged) or a dirty
   tree would conflict, stop and surface it.
