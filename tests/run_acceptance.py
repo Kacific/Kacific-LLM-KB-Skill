@@ -1043,6 +1043,109 @@ def prescan_sentence_split_holds_on_estate_prose():
     return not bad, f"mismatches={bad}"
 
 
+@check
+def pin_audit_catches_a_body_left_open_after_its_source_closed():
+    """The regression case that shipped: a re-pin moved the SHA forward and left the body claiming DRAFT.
+
+    Shape taken from a real defect, particulars genericised for a public repo. The nugget published a
+    "Status: DRAFT ... not yet issued" line while the
+    file it pinned said the notice had been sent and finalised, so the KB asserted a live obligation that
+    had already been discharged. Nothing else in kb.py could see it: the pin was current, the prose was
+    complete, and the body hash matched the registry it was published from.
+    """
+    meta = {"id": "seed-plans-notice", "tags": ["prescan"], "domain": "technical",
+            "source": "https://github.com/o/r/blob/" + "a" * 40 + "/plans/notice.md"}
+    body = ("**Section:** Planning. **Status:** DRAFT, refined 2026-07-08 (press-for-early-June "
+            "commencement), **not yet issued to the counterparty.**")
+    source = ("# Supplier termination notice\n\n**Section:** Planning. **Status:** SENT + FINALISED "
+              "2026-08-18; the counterparty confirmed the last day of service.\n")
+    row = kb.audit_pin_row(meta, body, source)
+    caught = row["verdict"] == "stale-status"
+    names_both = "draft" in row["detail"] and ("sent" in row["detail"] or "finalised" in row["detail"])
+    # Same defect in a HAND-WRITTEN body must also be caught; it is the reader-facing falsehood either way.
+    hand = kb.audit_pin_row({"id": "x", "tags": [], "source": meta["source"]}, body, source)
+    caught_hand = hand["verdict"] == "stale-status"
+    return caught and names_both and caught_hand, \
+        f"verdict={row['verdict']!r} detail={row['detail']!r} hand={hand['verdict']!r}"
+
+
+@check
+def pin_audit_verdict_never_rests_on_which_side_carries_a_later_date():
+    """A later date in the body is not evidence the body is right. Encoded because a review got this wrong.
+
+    A 2026-09-02 pass ranked stored-versus-source by date and concluded three bodies were hand-improved and
+    must not be touched. Two of them were in fact stale AND truncated, and the "newer" date was simply the
+    day someone wrote a line that had since been overtaken. The check must not acquire that reasoning.
+    """
+    meta = {"id": "seed-x", "tags": ["prescan"], "domain": "technical",
+            "source": "https://github.com/o/r/blob/" + "b" * 40 + "/apps/catalogue.md"}
+    # Body carries the LATER date and is still the stale one: source says the count moved on.
+    body = "**Status:** open. Master catalogue of 50 code repos, ingested 2026-07-16."
+    source = ("# Catalogue\n\n**Status:** superseded 2026-05-01. Master catalogue of 71 repos: 66 active "
+              "and 5 archived.\n")
+    late_body_still_flagged = kb.audit_pin_row(meta, body, source)["verdict"] == "stale-status"
+    # And the mirror: an EARLIER-dated body that agrees with its source must not be flagged just for the date.
+    agree = "**Status:** done 2020-01-01. Runs on demand plus a daily cron."
+    src2 = "# T\n\n**Status:** done 2026-08-01. Runs on demand plus a daily cron.\n"
+    early_body_not_flagged = kb.audit_pin_row(meta, agree, src2)["verdict"] != "stale-status"
+    return late_body_still_flagged and early_body_not_flagged, \
+        f"late_flagged={late_body_still_flagged} early_not_flagged={early_body_not_flagged}"
+
+
+@check
+def pin_audit_does_not_report_hand_written_bodies_as_drift_forever():
+    """A hand-written body never reproduces from the generator, so comparing it that way is permanent noise.
+
+    Measured on the real corpus: 14 of 23 rows the first draft reported were hand-written pointers that
+    would have been reported on every run for ever. A report that is always noisy stops being read, which
+    would cost more than the check buys.
+    """
+    src = "# Guide\n\nA short upstream sentence that the generator would use verbatim.\n"
+    hand = {"id": "skill-x", "tags": [], "domain": "technical",
+            "source": "https://github.com/o/r/blob/" + "c" * 40 + "/docs/guide.md"}
+    gen = dict(hand, id="seed-x", tags=["prescan"])
+    prose = "A carefully hand-written summary that no generator would ever produce from that file."
+    quiet_for_hand = kb.audit_pin_row(hand, prose, src)["verdict"] == "ok"
+    # The same divergence in a GENERATED body is still surfaced, or the check would have gone blind.
+    flagged_for_generated = kb.audit_pin_row(gen, prose, src)["verdict"] == "diverged"
+    unreadable = kb.audit_pin_row(gen, prose, None)["verdict"] == "unfetchable"
+    # A pointer-line abstract names the SEED KEY, not the domain. Reading it from the wrong field reports
+    # every such nugget as changed when nothing has; caught on the real corpus before this shipped.
+    ptr = {"id": "seed-shadow-it-h", "tags": ["prescan", "shadow_it", "Technical"], "domain": "technical",
+           "source": "https://github.com/o/r/blob/" + "e" * 40 + "/handoffs/nat.md"}
+    runon = "# H\n\n" + "word " * 200 + "\n"
+    stored_ptr = kb._candidate_abstract("x " * 300, "handoffs/nat.md", "shadow-it")
+    key_ok = kb.audit_pin_row(ptr, kb._candidate_abstract(
+        kb._extract_title_abstract(runon, "nat.md", True)[1], "handoffs/nat.md", "shadow-it"),
+        runon)["verdict"] == "ok"
+    return quiet_for_hand and flagged_for_generated and unreadable and key_ok and stored_ptr, \
+        f"hand={quiet_for_hand} generated={flagged_for_generated} unfetchable={unreadable} key={key_ok}"
+
+
+@check
+def pin_audit_status_words_come_from_status_lines_not_loose_prose():
+    """Scoped to status lines: prose says "done" and "pending" in passing and must not trip the severe flag."""
+    meta = {"id": "seed-y", "tags": ["prescan"], "domain": "technical",
+            "source": "https://github.com/o/r/blob/" + "d" * 40 + "/docs/n.md"}
+    chatty = "Once the migration is done there is nothing pending, though a draft existed at one point."
+    src = "# N\n\nOnce the migration is done there is nothing pending, though a draft existed at one point.\n"
+    no_false_alarm = kb.audit_pin_row(meta, chatty, src)["verdict"] != "stale-status"
+    tokens_scoped = kb._status_tokens(chatty) == set()
+    # "not yet issued" claims the thing is OPEN. Reading `issued` out of it would put a closed token on the
+    # open side and cancel a real finding, so negation is a correctness requirement, not neatness.
+    tokens_read = kb._status_tokens("**Status:** DRAFT, not yet issued.") == {"draft"}
+    negation_suppressed = kb._status_tokens("**Status:** not sent, never finalised.") == set()
+    # The end-to-end consequence: the finding must survive a body that says "not yet issued".
+    meta2 = dict(meta, id="seed-z")
+    survives = kb.audit_pin_row(
+        meta2, "**Status:** DRAFT, not yet issued to the counterparty.",
+        "# N\n\n**Status:** ISSUED 2026-08-18, acknowledged.\n")["verdict"] == "stale-status"
+    return no_false_alarm and tokens_scoped and tokens_read and negation_suppressed and survives, \
+        (f"no_false_alarm={no_false_alarm} loose={kb._status_tokens(chatty)} "
+         f"line={kb._status_tokens('**Status:** DRAFT, not yet issued.')} "
+         f"negation={negation_suppressed} survives={survives}")
+
+
 # --- audience slicing -------------------------------------------------------
 
 def _slice_aggregate() -> dict:
