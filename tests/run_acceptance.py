@@ -1146,6 +1146,53 @@ def pin_audit_status_words_come_from_status_lines_not_loose_prose():
          f"negation={negation_suppressed} survives={survives}")
 
 
+@check
+def pin_audit_strips_the_url_fragment_before_asking_for_the_file():
+    """A `#fragment` is not part of the path. Leaving it on turns a sound pointer into a dead one.
+
+    The regression case, and it shipped as a published finding before it was caught: two nuggets pointing at
+    one section of a file were reported as broken provenance, because the audit asked the API for a file
+    literally named "00-conventions-and-paths.md#8a-section-name-with--a-double-hyphen". That 404s.
+    """
+    url = ("https://github.com/o/r/blob/" + "7" * 40 +
+           "/00-conventions-and-paths.md#8a-section-name-with--a-double-hyphen")
+    parts = kb.parse_source_url(url)
+    path_clean = parts["path"] == "00-conventions-and-paths.md"
+    frag_kept = parts["fragment"].startswith("8a-")
+    pinned = parts["pinned"] is True and parts["kind"] == "blob"
+    # End to end: a fragment pointer whose body matches its source must come back ok, not unfetchable.
+    meta = {"id": "reusable-x", "tags": [], "source": url}
+    verdict = kb.audit_pin_row(meta, "A hand-written pointer body.", "# C\n\nSome section text.\n")["verdict"]
+    return path_clean and frag_kept and pinned and verdict == "ok", \
+        f"path={parts['path']!r} fragment={parts['fragment'][:12]!r} pinned={pinned} verdict={verdict!r}"
+
+
+@check
+def pin_audit_separates_an_unpinned_ref_from_an_unreadable_one():
+    """A source on `main` is a real finding, not a fetch failure, and must not hide in `unfetchable`.
+
+    The two are opposite in meaning: an unreadable blob claims nothing, while a moving ref means the pointer
+    is not a pin at all and drift against it can never be audited. Lumping them lost that distinction.
+    """
+    moving = {"id": "seed-a", "tags": ["prescan"],
+              "source": "https://github.com/o/r/blob/main/docs/api.md"}
+    # Reported even though the fetch SUCCEEDED, because the defect is the ref, not the read.
+    row = kb.audit_pin_row(moving, "body", "# A\n\nSome text.\n")
+    flagged = row["verdict"] == "unpinned-ref" and "main" in row["detail"]
+    # A directory pin is sound and simply has no body to compare; it is not a defect and not unfetchable.
+    tree = {"id": "seed-b", "tags": [], "source": "https://github.com/o/r/tree/" + "b" * 40 + "/docs/adr"}
+    dir_ok = kb.audit_pin_row(tree, "body", None)["verdict"] == "directory-pointer"
+    # A non-GitHub source is likewise not auditable and not a defect.
+    ext = kb.audit_pin_row({"id": "c", "tags": [], "source": "https://crt.sh/"}, "body", None)
+    ext_ok = ext["verdict"] == "external-pointer"
+    # A genuinely unreadable pinned blob still reports unfetchable, or the check has gone blind.
+    dead = kb.audit_pin_row({"id": "d", "tags": ["prescan"],
+                             "source": "https://github.com/o/r/blob/" + "c" * 40 + "/gone.md"}, "b", None)
+    dead_ok = dead["verdict"] == "unfetchable"
+    return flagged and dir_ok and ext_ok and dead_ok, \
+        f"moving={row['verdict']!r} tree={dir_ok} external={ext_ok} unfetchable={dead_ok}"
+
+
 # --- audience slicing -------------------------------------------------------
 
 def _slice_aggregate() -> dict:
