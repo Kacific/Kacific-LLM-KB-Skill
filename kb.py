@@ -2202,6 +2202,31 @@ def _seed_key_of(meta: dict) -> str:
     return str(meta.get("domain") or "seed")
 
 
+def _body_claims_are_in_source(body: str, source_text: str) -> bool:
+    """True when every distinctive term the body asserts also appears in the source document.
+
+    The regeneration comparison asks "does this body reproduce from paragraph one", which a body someone
+    has since IMPROVED never does. Eight such rows sat in the report permanently, every one verified by
+    hand as true of its source, and a report that is always noisy is one nobody reads. This separates a
+    body that has DRIFTED from its source from one that summarises MORE of the same document than the
+    generator reads.
+
+    Distinctive terms only: the backticked identifiers and bolded phrases a body commits to. Ordinary
+    prose is not compared, because paraphrase is what a good summary does and demanding literal overlap
+    would put every hand-written body straight back into the report.
+
+    Conservative by construction. One absent term keeps the row flagged, because the expensive direction
+    here is clearing a real drift, not carrying a false one. A body with no distinctive terms at all
+    stays flagged too: there is nothing to check, which is not the same as having checked.
+    """
+    terms = [t for pair in re.findall(r"`([^`\n]{4,40})`|\*\*([^*\n]{6,40})\*\*", str(body or ""))
+             for t in pair if t]
+    if not terms:
+        return False
+    src = str(source_text or "")
+    return all(t in src for t in dict.fromkeys(terms))
+
+
 def audit_tree_row(meta: dict, tree_names: tuple | None) -> dict:
     """Classify a DIRECTORY pin by what the directory now holds. Pure; no network, no clock.
 
@@ -2287,6 +2312,9 @@ def audit_pin_row(meta: dict, body: str, source_text: str | None,
     regenerated = _candidate_abstract(raw, relpath, _seed_key_of(meta))
     if stored == regenerated.strip():
         return {"id": meta.get("id"), "verdict": "ok", "detail": ""}
+    if _body_claims_are_in_source(body, source_text):
+        return {"id": meta.get("id"), "verdict": "enriched",
+                "detail": "body says more than the generator reads, and every claim it makes is in the source"}
     return {"id": meta.get("id"), "verdict": "diverged", "detail": "body is not what this source yields; "
                                                                   "needs a human read, not a regeneration"}
 
@@ -2394,7 +2422,8 @@ def cmd_pin_audit(args) -> int:
                                       tree_names=_fetch_tree_names(meta["source"], token)))
         else:
             rows.append(audit_pin_row(meta, n["body"], _fetch_pinned_source(meta["source"], token)))
-    verdicts = ("ok", "stale-status", "stale-tree", "diverged", "unpinned-ref", "directory-pointer",
+    verdicts = ("ok", "stale-status", "stale-tree", "diverged", "enriched", "unpinned-ref",
+                "directory-pointer",
                 "external-pointer", "unfetchable")
     counts = {v: sum(1 for r in rows if r["verdict"] == v) for v in verdicts}
     # The report states its own scope, because the reader cannot see it in the findings. This command takes
@@ -2412,7 +2441,8 @@ def cmd_pin_audit(args) -> int:
         for verdict, label in (("stale-status", "SEVERE: body publishes an open status its source has closed"),
                                ("stale-tree", "SEVERE: a pinned DIRECTORY has gained or lost files since the pin"),
                                ("unpinned-ref", "source is not pinned to a fixed SHA, so drift is unauditable"),
-                               ("diverged", "needs a human read (a hand-improved body looks like this too)"),
+                               ("diverged", "needs a human read: the body does not follow from this source"),
+                               ("enriched", "hand-improved and consistent with its source; no action"),
                                ("unfetchable", "pinned blob unreadable; nothing claimed"),
                                ("directory-pointer", "sound pin, no body to compare"),
                                ("external-pointer", "outside GitHub, not auditable here")):
