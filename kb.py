@@ -645,21 +645,37 @@ def _log_interaction(record: dict, log_path: str = "logs/interactions.jsonl") ->
 # Emitted byte-identical into every governed repo's AGENTS.md from the repo-standards
 # template, so its presence is a reliable machine signal that a repo opts into these rules.
 MANAGED_BLOCK_MARKER = "kacific:concurrency-coordination"
-GUARD_REFUSED_SHARED_CHECKOUT = 2
-GUARD_REFUSED_INDETERMINATE = 3
+# 2 is argparse's own usage-error code, so a caller keying on it could not tell "refused,
+# go and make a worktree" from "you mistyped a flag". 1 is already the schema refusal.
+GUARD_REFUSED_SHARED_CHECKOUT = 4
+GUARD_REFUSED_INDETERMINATE = 5
 _GUARD_GIT_TIMEOUT = 5
+
+# git reads its own environment before it reads the filesystem, so an inherited GIT_DIR or
+# GIT_COMMON_DIR silently redirects every question the guard asks and the answer comes back
+# describing a DIFFERENT repository. That is not exotic: git exports GIT_DIR into hooks,
+# `rebase --exec`, `bisect run`, `submodule foreach`, and the shell you are dropped into
+# mid-rebase. Left unscrubbed it turned R1 from fail-closed into fail-OPEN, demonstrated by
+# writing into a governed main checkout with one variable set.
+_GUARD_GIT_ENV_STRIP = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+)
 
 
 def _guard_git(args: list, cwd: str):
     """Run git for the guard. Returns stripped stdout, or None for any failure at all.
 
-    Every exception is swallowed rather than propagated, and the caller reads None as
+    The environment is scrubbed of every git-steering variable first, see above. Every
+    exception is swallowed rather than propagated, and the caller reads None as
     could-not-determine. Note the exception is never stringified: a subprocess error
     embeds its full argv, which is how paths and credentials reach a transcript.
     """
+    env = {k: v for k, v in os.environ.items() if k not in _GUARD_GIT_ENV_STRIP}
     try:
         p = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True,
-                           timeout=_GUARD_GIT_TIMEOUT, stdin=subprocess.DEVNULL)
+                           timeout=_GUARD_GIT_TIMEOUT, stdin=subprocess.DEVNULL, env=env)
     except Exception:
         return None
     if p.returncode != 0:
@@ -679,73 +695,152 @@ def _nearest_existing_dir(path) -> str:
     return p
 
 
-def _repo_is_governed(root: str) -> bool:
-    """True when the repo root carries the managed concurrency block. AGENTS.md is often a
-    symlink to CLAUDE.md, so both are read and either satisfies it."""
+def _repo_governance(root: str):
+    """True governed, False not governed, None COULD NOT LOOK.
+
+    The three must stay distinct. Collapsing could-not-look into not-governed is how a
+    repo with an unreadable AGENTS.md quietly stops being policed, and this function had
+    exactly that defect: a bare `except OSError` swallowed a permission error and returned
+    the same value as a repo that simply has no managed block.
+
+    AGENTS.md is usually a symlink to CLAUDE.md, so both are consulted and either
+    satisfies it. A DANGLING symlink is could-not-look, not absent: something meant to be
+    there and is not resolvable, which is a fact about the repo rather than about its
+    governance.
+    """
+    unreadable = False
     for name in ("AGENTS.md", "CLAUDE.md"):
+        p = Path(root, name)
         try:
-            if MANAGED_BLOCK_MARKER in Path(root, name).read_text(encoding="utf-8"):
+            if p.is_symlink() and not p.exists():
+                unreadable = True
+                continue
+            if MANAGED_BLOCK_MARKER in p.read_text(encoding="utf-8"):
                 return True
-        except OSError:
+        except FileNotFoundError:
             continue
-    return False
+        except (OSError, ValueError):
+            # ValueError covers UnicodeDecodeError, which is NOT an OSError and used to
+            # escape as a traceback in the user's face on a single non-UTF-8 byte.
+            unreadable = True
+    return None if unreadable else False
+
+
+def _checkout_kind(cwd: str):
+    """"main", "worktree", or None for could-not-determine.
+
+    A main checkout has its git dir EQUAL to the common git dir; a linked worktree's git
+    dir is .git/worktrees/<name> underneath it. Both paths are taken in absolute form from
+    the same cwd so there is nothing to resolve by hand.
+
+    `--path-format=absolute` needs git 2.31+. On an older git this returns None, which the
+    caller treats as indeterminate and therefore REFUSES. An earlier version tried to be
+    helpful here by falling back to the bare option and joining the relative answer onto
+    the directory git was asked from. That was wrong in the one direction that matters:
+    `--git-common-dir` answers relative to the repo TOP LEVEL on some versions, while the
+    directory being asked from is routinely a subdirectory (the domain directory of an
+    existing KB repo), so the join produced <repo>/technical/.git, which does not match the
+    real git dir, and a mismatch is read as "linked worktree" and ALLOWED. A guard whose
+    compatibility shim fails open is worse than one that refuses on an old git and says so.
+    """
+    git_dir = _guard_git(["rev-parse", "--absolute-git-dir"], cwd=cwd)
+    common = _guard_git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=cwd)
+    if not git_dir or not common:
+        return None
+    return "main" if os.path.realpath(git_dir) == os.path.realpath(common) else "worktree"
 
 
 def guard_write_destination(dest_dir) -> tuple:
     """R1. Returns (exit_code, lines): 0 to allow, non-zero to refuse.
 
     The decision ladder, and each rung's default matters:
-      not inside a git repo        -> ALLOW  (temp dirs, the acceptance test, any scratch)
-      repo carries no managed block-> ALLOW  (the repo did not opt in; not ours to police)
-      linked worktree              -> ALLOW  (this is the sanctioned place to write)
-      shared main checkout         -> REFUSE (the rule this whole guard exists for)
-      anything indeterminate       -> REFUSE (operator ruling: ambiguity fails closed)
+      not inside any git repo       -> ALLOW  (temp dirs, the acceptance test, any scratch)
+      innermost is a linked worktree-> ALLOW  (the sanctioned place to write; walk stops)
+      an enclosing GOVERNED repo is
+        a shared main checkout      -> REFUSE (the rule this whole guard exists for)
+      no enclosing governed repo    -> ALLOW  (nobody opted in; not ours to police)
+      anything indeterminate        -> REFUSE (operator ruling: ambiguity fails closed)
 
     "Shared main checkout" is decided by comparing the git dir with the common git dir. In
     a main checkout they are the same directory; in a linked worktree the former is
     .git/worktrees/<name> under the latter. This avoids having to identify WHICH clone is
     the declared read-only mirror, which nothing on disk marks: an incidental all-org
     mirror is by definition a main checkout, so it is covered without being named.
+
+    INDETERMINATE IS A REAL CATEGORY AND MUST STAY ONE. Everything that means "could not
+    look" refuses: no resolvable parent directory, git absent from PATH, a governance file
+    that exists but will not read, a git too old to answer the worktree question, or a
+    destination inside a .git directory. Each of those used to return the same value as a
+    clean allow, which is how a guard reports a confident all-clear about a question it
+    never managed to ask.
     """
+    def indeterminate(why, root=None):
+        lines = ["REFUSED. The guard could not determine whether this destination is safe,",
+                 "and ambiguity refuses here rather than guessing.",
+                 "  destination: %s" % os.path.realpath(str(dest_dir)),
+                 "  reason:      %s" % why]
+        if root:
+            lines.append("  repo:        %s" % root)
+        return GUARD_REFUSED_INDETERMINATE, lines
+
     base = _nearest_existing_dir(dest_dir)
     if not base:
-        return GUARD_REFUSED_INDETERMINATE, [
-            "REFUSED. Could not resolve any existing parent of the destination:",
-            "  %s" % dest_dir,
-            "The guard refuses rather than guesses when it cannot look."]
+        return indeterminate("no existing parent directory of the destination could be resolved")
+    if shutil.which("git") is None:
+        # Without git nothing below can be answered, and every question would return None,
+        # which the old ladder read as "not a git repo" and ALLOWED. A missing tool is a
+        # could-not-look, never an all-clear.
+        return indeterminate("git is not on PATH, so no repository question can be answered")
+    if _guard_git(["rev-parse", "--is-inside-git-dir"], cwd=base) == "true":
+        return indeterminate("the destination is inside a .git directory")
 
-    root = _guard_git(["rev-parse", "--show-toplevel"], cwd=base)
-    if not root:
-        return 0, []  # not a git repo: nothing to police
-    root = os.path.realpath(root)
+    # Walk OUTWARD through enclosing repositories. The innermost answer alone is not
+    # enough: a submodule or any vendored clone inside a governed checkout is its own
+    # repository, carries no managed block, and used to be allowed, which let a write land
+    # inside the very checkout being policed.
+    #
+    # The walk stops at the first LINKED WORKTREE, deliberately. Worktrees live at
+    # <repo>/.claude/worktrees/<task>, so they sit inside the governed main checkout's own
+    # directory tree; continuing outward from one would find the parent main checkout and
+    # refuse the sanctioned destination.
+    cur, seen = base, set()
+    while cur:
+        root = _guard_git(["rev-parse", "--show-toplevel"], cwd=cur)
+        if not root:
+            break  # no further enclosing repository
+        root = os.path.realpath(root)
+        if root in seen:
+            break
+        seen.add(root)
 
-    if not _repo_is_governed(root):
-        return 0, []  # repo has not opted in
+        governed = _repo_governance(root)
+        if governed is None:
+            return indeterminate("AGENTS.md or CLAUDE.md exists but could not be read", root)
 
-    git_dir = _guard_git(["rev-parse", "--absolute-git-dir"], cwd=base)
-    common = _guard_git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=base)
-    if not common:
-        # --path-format wants git 2.31+. Without it --git-common-dir answers relatively
-        # (plain ".git" in a main checkout), and a relative path must be resolved against
-        # the directory git was asked from, never against this process's cwd. Getting that
-        # wrong would refuse every governed store on an older git, which is a fail-closed
-        # default doing real damage.
-        rel = _guard_git(["rev-parse", "--git-common-dir"], cwd=base)
-        common = os.path.join(base, rel) if rel else None
-    if not git_dir or not common:
-        return GUARD_REFUSED_INDETERMINATE, [
-            "REFUSED. This repo is governed by the worktree rule, but the guard could not",
-            "determine whether this is a worktree or a shared main checkout.",
-            "  destination: %s" % dest_dir,
-            "  repo:        %s" % root,
-            "Ambiguity refuses here, by ruling. Re-run from a worktree, or fix the repo."]
+        kind = _checkout_kind(cur)
+        if kind is None:
+            return indeterminate(
+                "could not tell a worktree from a main checkout (git older than 2.31?)", root)
+        if kind == "worktree":
+            return 0, []  # sanctioned destination, and the outward walk stops here
+        if governed:
+            return _refuse_shared(dest_dir, root)
 
-    if os.path.realpath(git_dir) != os.path.realpath(common):
-        return 0, []  # a linked worktree: the sanctioned destination
+        parent = os.path.dirname(root)
+        cur = parent if parent != root and os.path.isdir(parent) else None
 
+    return 0, []
+
+
+def _refuse_shared(dest_dir, root: str) -> tuple:
+    """The refusal message. It names the path, names the rule, and prints a runnable
+    command, because a guard that only says no gets routed around and the workaround is
+    worse than the thing being prevented."""
     return GUARD_REFUSED_SHARED_CHECKOUT, [
         "REFUSED. This write would land in a SHARED MAIN CHECKOUT, not a worktree.",
-        "  destination: %s" % dest_dir,
+        # Resolved, not as typed: a relative --into printed verbatim beside an absolute
+        # repo line reads as though they were two unrelated places.
+        "  destination: %s" % os.path.realpath(str(dest_dir)),
         "  repo:        %s" % root,
         "",
         "  Why: this repo's AGENTS.md carries the managed concurrency block, which says",
@@ -776,15 +871,28 @@ def guard_occupancy_warnings(dest_dir) -> list:
     lib = os.environ.get("KACIFIC_ESTATE_LIB")
     if not lib:
         return []
+    # Loaded by explicit file path rather than by prepending an operator directory to
+    # sys.path, which would shadow the stdlib for the rest of the process for any name
+    # that directory ever gains.
     try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "kacific_worktree_guard", os.path.join(lib, "worktree_guard.py"))
+        if spec is None or spec.loader is None:
+            raise ImportError("no loadable worktree_guard.py")
+        mod = importlib.util.module_from_spec(spec)
         if lib not in sys.path:
-            sys.path.insert(0, lib)
-        import worktree_guard  # noqa: E402  (optional, resolved at call time by design)
-        return worktree_guard.warning_lines(str(dest_dir))
-    except ImportError:
-        return ["NOTE: KACIFIC_ESTATE_LIB is set to %s but worktree_guard could not be" % lib,
-                "      imported, so the live-session occupancy check did not run.",
+            sys.path.append(lib)  # appended, not prepended: the helper imports a sibling
+        spec.loader.exec_module(mod)
+    except Exception:
+        # Deliberately ONE branch. Splitting import errors from others meant an exception
+        # raised inside the helper was reported as "could not be imported", which sends
+        # the reader to look at the wrong thing entirely.
+        return ["NOTE: KACIFIC_ESTATE_LIB is set to %s but the occupancy helper could not" % lib,
+                "      be loaded, so the live-session check did not run.",
                 "      Proceeding. This is a could-not-look, not an all-clear."]
+    try:
+        return mod.warning_lines(str(dest_dir))
     except Exception:
         return ["NOTE: the live-session occupancy check failed and was skipped.",
                 "      Proceeding. This is a could-not-look, not an all-clear."]
@@ -802,7 +910,10 @@ def cmd_store(args) -> int:
             print(f"  - {e}", file=sys.stderr)
         return 1
     if args.into:
-        dest_dir = Path(args.into) / (meta.get("domain") or "shared")
+        # expanduser first: a quoted or non-shell-expanded ~ used to create a literal "~"
+        # directory under the cwd and report success, which also put the destination
+        # outside any repo and so outside the guard entirely.
+        dest_dir = Path(os.path.expanduser(args.into)) / (meta.get("domain") or "shared")
         # The write-path guard sits here, before the mkdir, because creating the domain
         # directory is itself a write into the checkout being policed.
         code, refusal = guard_write_destination(dest_dir)

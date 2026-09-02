@@ -110,6 +110,22 @@ that reads the local machine's session store, which no clone carries and no CI h
 
 Neither case can stop a write that would otherwise succeed, and no part of the guard is a git hook.
 
+**`store` exit codes**, since a caller needs to tell these apart and two of them are not the guard's:
+
+| Code | Meaning |
+|---|---|
+| `0` | stored, or validated when no `--into` was given |
+| `1` | refused by the schema or anti-hallucination gate |
+| `2` | argparse usage error, not a refusal. Owned by argparse, listed so nothing else claims it |
+| `4` | refused by the guard: the destination is a shared main checkout of a governed repo |
+| `5` | refused by the guard: it could not determine whether the destination was safe |
+
+`5` is a **could-not-look**, never an all-clear, and it is deliberately distinct from `4`. It covers git
+being absent, a governance file that exists but will not read, a git too old to answer the worktree
+question, and a destination inside a `.git` directory. Do not "simplify" any of those into an allow: a
+guard that reports success on a question it never managed to ask is worse than no guard, because it is
+believed.
+
 ## Role
 
 The KB manager stores and provides the estate's sources of truth. One SSOT per fact; everything else is a

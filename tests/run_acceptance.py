@@ -13,6 +13,7 @@ Exit: 0 if every check passes, 1 if any fails (the failures are listed).
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -1680,6 +1681,170 @@ def a_malformed_date_is_reported_rather_than_cleared():
     row = next((r for r in json.loads(p.stdout)["rows"] if r["id"] == "typo-date"), None)
     ok = row is not None and row["verdict"] == "unparseable"
     return ok, f"verdict={row['verdict'] if row else None} (must not be silently cleared)"
+
+
+# --- write-path guard (R1) ---------------------------------------------------
+#
+# R1 is the half that FAILS CLOSED and the half that must work on a cold clone with no
+# config and no optional helper, and it shipped with zero coverage here while the optional
+# advisory half had a thorough selftest. That inverts the risk: an adversarial review found
+# five ways to make R1 allow a write it should refuse, and every one of them would have
+# passed this suite green. These checks exist so that cannot recur silently.
+#
+# Each builds its own throwaway repo, so nothing here depends on the estate's real layout.
+
+def _guard_repo(tmp: Path, governed: bool) -> Path:
+    """A git repo, optionally carrying the managed concurrency block."""
+    root = tmp / ("gov" if governed else "plain")
+    root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=root, capture_output=True)
+    if governed:
+        _write(root / "AGENTS.md",
+               f"# test repo\n<!-- BEGIN {kb.MANAGED_BLOCK_MARKER} -->\nblock\n"
+               f"<!-- END {kb.MANAGED_BLOCK_MARKER} -->\n")
+    return root
+
+
+@check
+def guard_refuses_store_into_a_governed_main_checkout():
+    with tempfile.TemporaryDirectory() as td:
+        root = _guard_repo(Path(td), governed=True)
+        p = run("store", str(VALID_REFERENCE), "--into", str(root))
+        wrote = (root / "technical").exists()
+        ok = p.returncode == kb.GUARD_REFUSED_SHARED_CHECKOUT and not wrote
+        return ok, f"rc={p.returncode} (want {kb.GUARD_REFUSED_SHARED_CHECKOUT}) wrote={wrote}"
+
+
+@check
+def guard_refusal_names_the_path_the_rule_and_a_runnable_command():
+    with tempfile.TemporaryDirectory() as td:
+        root = _guard_repo(Path(td), governed=True)
+        p = run("store", str(VALID_REFERENCE), "--into", str(root))
+        msg = p.stderr
+        # A guard that only says no gets routed around, and the workaround is worse than
+        # the thing being prevented, so the message is part of the contract.
+        ok = ("worktree add" in msg and str(root) in msg
+              and "SHARED MAIN CHECKOUT" in msg)
+        return ok, f"names_path={str(root) in msg} names_rule={'SHARED MAIN CHECKOUT' in msg} has_command={'worktree add' in msg}"
+
+
+@check
+def guard_allows_store_into_a_linked_worktree():
+    with tempfile.TemporaryDirectory() as td:
+        root = _guard_repo(Path(td), governed=True)
+        _write(root / "seed.txt", "x")
+        for cmd in (["add", "-A"], ["-c", "user.email=t@t", "-c", "user.name=t",
+                                    "commit", "-qm", "seed"]):
+            subprocess.run(["git", *cmd], cwd=root, capture_output=True)
+        wt = Path(td) / "wt"
+        r = subprocess.run(["git", "worktree", "add", "-q", str(wt)],
+                           cwd=root, capture_output=True, text=True)
+        if r.returncode != 0:
+            return False, f"could not create the worktree fixture: {r.returncode}"
+        p = run("store", str(VALID_REFERENCE), "--into", str(wt))
+        ok = p.returncode == 0 and (wt / "technical").exists()
+        return ok, f"rc={p.returncode} (want 0) stderr={p.stderr.strip()[:80]!r}"
+
+
+@check
+def guard_ignores_a_repo_without_the_managed_block():
+    with tempfile.TemporaryDirectory() as td:
+        root = _guard_repo(Path(td), governed=False)
+        p = run("store", str(VALID_REFERENCE), "--into", str(root))
+        ok = p.returncode == 0 and (root / "technical").exists()
+        return ok, f"rc={p.returncode} (want 0, the repo never opted in)"
+
+
+@check
+def guard_ignores_an_inherited_git_dir_environment():
+    # git reads GIT_DIR and GIT_COMMON_DIR before it reads the filesystem, so an inherited
+    # one silently redirects every question the guard asks. Unscrubbed, this single
+    # variable turned R1 from fail-closed into fail-open.
+    with tempfile.TemporaryDirectory() as td:
+        root = _guard_repo(Path(td), governed=True)
+        other = _guard_repo(Path(td), governed=False)
+        env_cases = [
+            {"GIT_COMMON_DIR": str(Path(td) / "nowhere")},
+            {"GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other)},
+        ]
+        details = []
+        for extra in env_cases:
+            env = {**os.environ, **extra}
+            p = subprocess.run(
+                [sys.executable, str(KB_PY), "store", str(VALID_REFERENCE),
+                 "--into", str(root)],
+                capture_output=True, text=True, cwd=str(REPO_ROOT), env=env)
+            details.append(f"{','.join(extra)}->rc{p.returncode}")
+            if p.returncode != kb.GUARD_REFUSED_SHARED_CHECKOUT:
+                return False, f"FAILED OPEN with {details[-1]}"
+            if (root / "technical").exists():
+                return False, f"wrote into the main checkout with {','.join(extra)}"
+        return True, " ".join(details)
+
+
+@check
+def guard_treats_an_unreadable_governance_file_as_could_not_look():
+    # "could not read" and "not governed" must not return the same value, or a repo with a
+    # broken AGENTS.md quietly stops being policed.
+    with tempfile.TemporaryDirectory() as td:
+        root = _guard_repo(Path(td), governed=True)
+        (root / "AGENTS.md").write_bytes(b"\xff\xfe not utf-8")
+        p = run("store", str(VALID_REFERENCE), "--into", str(root))
+        ok = (p.returncode == kb.GUARD_REFUSED_INDETERMINATE
+              and "Traceback" not in p.stderr)
+        return ok, f"rc={p.returncode} (want {kb.GUARD_REFUSED_INDETERMINATE}) traceback={'Traceback' in p.stderr}"
+
+
+@check
+def guard_refuses_a_nested_repo_inside_a_governed_checkout():
+    # A submodule or vendored clone is its own repo and carries no block, so taking only
+    # the innermost answer let a write land inside the very checkout being policed.
+    with tempfile.TemporaryDirectory() as td:
+        root = _guard_repo(Path(td), governed=True)
+        nested = root / "vendor"
+        nested.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=nested, capture_output=True)
+        p = run("store", str(VALID_REFERENCE), "--into", str(nested))
+        ok = p.returncode == kb.GUARD_REFUSED_SHARED_CHECKOUT and not (nested / "technical").exists()
+        return ok, f"rc={p.returncode} (want {kb.GUARD_REFUSED_SHARED_CHECKOUT})"
+
+
+@check
+def guard_exit_codes_do_not_collide_with_argparse():
+    # argparse exits 2 on a usage error and cmd_store returns 1 on a schema refusal, so a
+    # caller keying on either could not tell those from a guard refusal.
+    p = run("store", "--no-such-flag")
+    ok = (p.returncode == 2
+          and kb.GUARD_REFUSED_SHARED_CHECKOUT not in (1, 2)
+          and kb.GUARD_REFUSED_INDETERMINATE not in (1, 2)
+          and kb.GUARD_REFUSED_SHARED_CHECKOUT != kb.GUARD_REFUSED_INDETERMINATE)
+    return ok, (f"argparse={p.returncode} shared={kb.GUARD_REFUSED_SHARED_CHECKOUT} "
+                f"indeterminate={kb.GUARD_REFUSED_INDETERMINATE}")
+
+
+@check
+def guard_r2_stays_silent_when_the_helper_is_not_configured():
+    # Every cold clone and every CI run is this case. It must be silent, not degraded.
+    with tempfile.TemporaryDirectory() as td:
+        root = _guard_repo(Path(td), governed=False)
+        env = {k: v for k, v in os.environ.items() if k != "KACIFIC_ESTATE_LIB"}
+        p = subprocess.run(
+            [sys.executable, str(KB_PY), "store", str(VALID_REFERENCE), "--into", str(root)],
+            capture_output=True, text=True, cwd=str(REPO_ROOT), env=env)
+        ok = p.returncode == 0 and "occupancy" not in p.stderr.lower()
+        return ok, f"rc={p.returncode} stderr={p.stderr.strip()[:60]!r}"
+
+
+@check
+def guard_r2_reports_a_could_not_look_when_the_helper_is_missing():
+    with tempfile.TemporaryDirectory() as td:
+        root = _guard_repo(Path(td), governed=False)
+        env = {**os.environ, "KACIFIC_ESTATE_LIB": str(Path(td) / "no-such-lib")}
+        p = subprocess.run(
+            [sys.executable, str(KB_PY), "store", str(VALID_REFERENCE), "--into", str(root)],
+            capture_output=True, text=True, cwd=str(REPO_ROOT), env=env)
+        ok = p.returncode == 0 and "could-not-look" in p.stderr
+        return ok, f"rc={p.returncode} said_could_not_look={'could-not-look' in p.stderr}"
 
 
 def main() -> int:
