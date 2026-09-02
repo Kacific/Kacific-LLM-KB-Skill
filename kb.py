@@ -155,7 +155,7 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 _FM_FIELD_ORDER = [
     "schema_version", "id", "title", "domain", "type", "status", "owner_gid", "owner_name",
     "provenance_type", "source", "attested_by", "attested_on", "confidence", "verified",
-    "verified_by",
+    "verified_by", "verified_by_name",
     "supersedes", "related", "tags",
 ]
 
@@ -239,6 +239,12 @@ def validate_entry(meta: dict, body: str) -> list[str]:
     # all. Using the parser also makes the message true of a typo'd date rather than only of a blank.
     if meta.get("verified_by") and _iso_date(meta.get("verified")) is None:
         errors.append("verified_by is set but verified is not a date; name the date that was verified")
+    # `verified_by` is a GID, which is what the report would otherwise print at a person. `owner_gid` has
+    # `owner_name` and `prescan --commit` requires the pair, so a readable twin is the house pattern for
+    # an identity a human reads. A name with no gid is the incoherent direction: it identifies nobody the
+    # estate can route to.
+    if meta.get("verified_by_name") and not meta.get("verified_by"):
+        errors.append("verified_by_name is set without verified_by; the gid is what identifies the person")
 
     # Voice gate: no em-dashes anywhere in the human-readable content.
     if "—" in body or "—" in str(meta.get("title", "")):
@@ -2436,6 +2442,12 @@ def cmd_pin_audit(args) -> int:
     step runnable instead of remembered.
     """
     root = Path(args.repo).expanduser().resolve()
+    if not root.is_dir():
+        # A typo'd path otherwise walks nothing and reports a clean run, so "could not look" comes back
+        # dressed as "nothing wrong". Exit 2 is this tool's could-not-proceed code, and the distinction
+        # matters most for an audit, whose whole output is an absence of findings.
+        print(f"pin-audit: no such repo directory: {root}", file=sys.stderr)
+        return 2
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     nuggets = _load_nuggets(root)
     rows = []
@@ -2505,6 +2517,9 @@ def cmd_verify_audit(args) -> int:
     unattributed count is worked down (see `schema/kb-entry.md`).
     """
     root = Path(args.repo).expanduser().resolve()
+    if not root.is_dir():
+        print(f"verify-audit: no such repo directory: {root}", file=sys.stderr)
+        return 2
     nuggets = _load_nuggets(root)
     rows = []
     for n in nuggets:
@@ -2516,6 +2531,10 @@ def cmd_verify_audit(args) -> int:
         # never made. Both were live until an adversarial review found them.
         raw = "" if meta.get("verified") is None else str(meta["verified"]).strip()
         who = "" if meta.get("verified_by") is None else str(meta["verified_by"]).strip()
+        # Print the readable twin where there is one. A bare gid in a human report is a 16-digit number
+        # handed to the person expected to act on it.
+        who_name = "" if meta.get("verified_by_name") is None else str(meta["verified_by_name"]).strip()
+        shown = f"{who_name} ({who})" if (who and who_name) else who
         if raw in ("", "unverified"):
             verdict, detail = "unverified", "claims no verification, so nothing to attribute"
         elif _iso_date(raw) is None:
@@ -2523,11 +2542,12 @@ def cmd_verify_audit(args) -> int:
             # rather than folded into "unverified", which would quietly clear a typo'd claim.
             verdict, detail = "unparseable", f"verified is {raw!r}, which is not an ISO-8601 date"
         elif who:
-            verdict, detail = "attributed", f"verified {raw} by {who}"
+            verdict, detail = "attributed", f"verified {raw} by {shown}"
         else:
             verdict, detail = "unattributed", f"claims verification on {raw} but names nobody"
         rows.append({"id": meta.get("id"), "verdict": verdict, "verified": raw or None,
-                     "verified_by": who or None, "detail": detail})
+                     "verified_by": who or None, "verified_by_name": who_name or None,
+                     "detail": detail})
 
     counts = {v: sum(1 for r in rows if r["verdict"] == v)
               for v in ("attributed", "unattributed", "unparseable", "unverified")}
