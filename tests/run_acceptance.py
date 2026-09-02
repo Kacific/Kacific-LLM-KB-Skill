@@ -1463,6 +1463,91 @@ def export_rendered_bundle_has_no_emdash():
     return ok, f"md_clean={emdash not in md} html_clean={emdash not in html_out}"
 
 
+@check
+def load_nuggets_ignores_a_nested_worktree():
+    # Sessions work in a gitignored `.claude/worktrees/<task>` INSIDE the repo, and rglob does not read
+    # .gitignore, so the same nuggets were counted twice whenever a worktree happened to be open. Found
+    # live: a peer's worktree made a real audience repo report 264 nuggets against a registry of 149,
+    # which would have had `rot` calling every id a duplicate.
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        _write(root / "shared" / "n.md", _nugget(id="only-once"))
+        _write(root / ".claude" / "worktrees" / "peer" / "shared" / "n.md", _nugget(id="only-once"))
+        found = kb._load_nuggets(root)
+    ids = [n["meta"]["id"] for n in found]
+    ok = ids == ["only-once"]
+    return ok, f"found={ids} (a nested worktree must not double the count)"
+
+
+@check
+def verify_audit_flags_a_date_that_names_nobody():
+    # The whole point of the field: a dated `verified` with no `verified_by` is a claim with nobody
+    # behind it, and before this command nothing in the tool could say so.
+    with tempfile.TemporaryDirectory() as d:
+        _write(Path(d) / "shared" / "n.md", _nugget(id="unattributed-note", verified="2020-01-01"))
+        p = run("verify-audit", "--repo", d, "--json")
+    rows = json.loads(p.stdout)["rows"]
+    row = next((r for r in rows if r["id"] == "unattributed-note"), None)
+    ok = p.returncode == 0 and row is not None and row["verdict"] == "unattributed"
+    return ok, f"rc={p.returncode} row={row}"
+
+
+@check
+def verify_audit_counts_an_attributed_date_as_sound():
+    with tempfile.TemporaryDirectory() as d:
+        _write(Path(d) / "shared" / "n.md",
+               _nugget(id="attributed-note", verified="2020-01-01", verified_by="0000000000000000"))
+        p = run("verify-audit", "--repo", d, "--json")
+    out = json.loads(p.stdout)
+    row = next((r for r in out["rows"] if r["id"] == "attributed-note"), None)
+    ok = (p.returncode == 0 and row is not None and row["verdict"] == "attributed"
+          and out["counts"]["unattributed"] == 0)
+    return ok, f"rc={p.returncode} row={row} counts={out['counts']}"
+
+
+@check
+def store_refuses_verified_by_without_a_date():
+    # Coherence only, and deliberately the ONLY refusal this change adds: naming a verifier for a
+    # verification that never happened is incoherent, while the reverse (a date naming nobody) is the
+    # entire existing corpus and stays legal until the staged flip.
+    with tempfile.TemporaryDirectory() as d:
+        f = _write(Path(d) / "bad.md",
+                   _nugget(verified="unverified", verified_by="0000000000000000"))
+        p = run("store", str(f))
+    ok = p.returncode == 1 and "REFUSED" in p.stderr and "verified_by" in p.stderr
+    return ok, f"rc={p.returncode} stderr={p.stderr.strip()!r}"
+
+
+@check
+def store_still_accepts_a_dated_verified_with_no_verifier():
+    # The staged promise, held by a test: every nugget that exists predates `verified_by`, so adding the
+    # field must refuse nothing that is already stored. If this ever fails, the flip happened by accident.
+    with tempfile.TemporaryDirectory() as d:
+        f = _write(Path(d) / "ok.md", _nugget(verified="2020-01-01"))
+        p = run("store", str(f))
+    ok = p.returncode == 0 and "passes" in p.stdout
+    return ok, f"rc={p.returncode} stdout={p.stdout.strip()!r}"
+
+
+@check
+def verified_by_survives_a_store_round_trip():
+    # It has to appear in _FM_FIELD_ORDER or emit_frontmatter drops it silently on the way out.
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d) / "repo"
+        repo.mkdir()
+        f = _write(Path(d) / "n.md",
+                   _nugget(id="roundtrip-note", domain="shared",
+                           verified="2020-01-01", verified_by="0000000000000000"))
+        p = run("store", str(f), "--into", str(repo))
+        stored = (repo / "shared" / "roundtrip-note.md")
+        # Read the existence flag INSIDE the block: the temp dir is gone by the time the detail string
+        # is built, so a post-hoc stored.exists() reports False on a passing check and reads as a bug.
+        existed = stored.exists()
+        text = stored.read_text(encoding="utf-8") if existed else ""
+    ok = p.returncode == 0 and "verified_by: 0000000000000000" in text
+    return ok, f"rc={p.returncode} stored={existed} has_field={'verified_by' in text}"
+
+
 def main() -> int:
     failures = 0
     for fn in CHECKS:

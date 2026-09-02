@@ -155,6 +155,7 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 _FM_FIELD_ORDER = [
     "schema_version", "id", "title", "domain", "type", "status", "owner_gid", "owner_name",
     "provenance_type", "source", "attested_by", "attested_on", "confidence", "verified",
+    "verified_by",
     "supersedes", "related", "tags",
 ]
 
@@ -228,6 +229,13 @@ def validate_entry(meta: dict, body: str) -> list[str]:
             errors.append("provenance_type attestation requires attested_by and attested_on")
     elif prov:
         errors.append(f"invalid provenance_type: {prov} (must be reference or attestation)")
+
+    # `verified` records WHEN, `verified_by` records WHO. Only the pair is auditable: a bare date cannot
+    # distinguish a person who read the body from a process that stamped it, so the two records are
+    # byte-identical and the unearned one is invisible for ever. `verified_by` is OPTIONAL for now
+    # (see `verify-audit`), so this checks coherence only and refuses nothing that exists today.
+    if meta.get("verified_by") and str(meta.get("verified", "")).strip() in ("", "unverified"):
+        errors.append("verified_by is set but verified is not a date; name the date that was verified")
 
     # Voice gate: no em-dashes anywhere in the human-readable content.
     if "—" in body or "—" in str(meta.get("title", "")):
@@ -381,6 +389,15 @@ def _load_nuggets(root: Path) -> list[dict]:
         if ".claude" in rel_parts or ".git" in rel_parts:
             continue
         if md.name in {"README.md", "registry.md", "AGENTS.md", "CLAUDE.md"} or "sources" in md.parts:
+            continue
+        # Skip dot-directories, which in practice means a NESTED WORKTREE. Sessions here work in a
+        # gitignored `.claude/worktrees/<task>` inside the repo, and rglob does not read .gitignore, so
+        # a checkout of the same branch was being walked as though it were more nuggets. Every count
+        # then doubles while a peer happens to have a worktree open: `rot` reports every id as a
+        # duplicate, `pin-audit` audits each pointer twice. The publish path never saw this because it
+        # rebuilds from each repo's remote HEAD rather than the working tree, which is exactly why it
+        # went unnoticed. Nugget directories are domain names and never start with a dot.
+        if any(part.startswith(".") for part in md.relative_to(root).parts):
             continue
         meta, body = parse_frontmatter(md.read_text(encoding="utf-8"))
         if not meta.get("id"):
@@ -2479,6 +2496,60 @@ def cmd_pin_audit(args) -> int:
     return 0
 
 
+def cmd_verify_audit(args) -> int:
+    """Report nuggets asserting a `verified` date that names nobody. Report-only; never writes.
+
+    `verified` is defined as *last human verification*, but it stores only a date. A date written after a
+    person read the body and a date written by a process that read nothing are byte-identical, so the
+    unearned one is invisible for ever. The hygiene sweep cannot help: `rot` flags a date for being too
+    OLD, and nothing anywhere flags one for being unearned. That asymmetry is one-directional by
+    construction, and it is why an over-claim is the expensive error: an under-claimed date gets the
+    nugget flagged and re-read, while an over-claimed one is simply believed.
+
+    `verified_by` closes it by recording WHO. This command reports the gap rather than refusing it,
+    because every nugget predates the field; enforcement moves into `validate_entry` once the
+    unattributed count is worked down (see `schema/kb-entry.md`).
+    """
+    root = Path(args.repo).expanduser().resolve()
+    nuggets = _load_nuggets(root)
+    rows = []
+    for n in nuggets:
+        meta = n["meta"]
+        raw = str(meta.get("verified", "")).strip()
+        who = str(meta.get("verified_by", "")).strip()
+        if raw in ("", "unverified"):
+            verdict, detail = "unverified", "claims no verification, so nothing to attribute"
+        elif who:
+            verdict, detail = "attributed", f"verified {raw} by {who}"
+        else:
+            verdict, detail = "unattributed", f"claims verification on {raw} but names nobody"
+        rows.append({"id": meta.get("id"), "verdict": verdict, "verified": raw or None,
+                     "verified_by": who or None, "detail": detail})
+
+    counts = {v: sum(1 for r in rows if r["verdict"] == v)
+              for v in ("attributed", "unattributed", "unverified")}
+    # Same scope discipline as pin-audit: this takes one --repo and the KB spans several audience repos,
+    # so a clean run here says nothing about the others.
+    scope = {"repo": root.name, "path": str(root), "nuggets_scanned": len(nuggets),
+             "covers": "this clone only"}
+    if args.json:
+        print(json.dumps({"scope": scope, "counts": counts, "rows": rows}, indent=2))
+        return 0
+
+    print(f"verify-audit scope: {scope['repo']} at {scope['path']}")
+    print(f"  {scope['nuggets_scanned']} nuggets scanned. THIS CLONE ONLY; run it once per audience repo.")
+    hits = [r for r in rows if r["verdict"] == "unattributed"]
+    if hits:
+        print(f"\nasserts a verification nobody is named for: {len(hits)}")
+        for r in hits:
+            print(f"  {r['id']}\n      {r['detail']}")
+    print(f"\nverify-audit: {counts['attributed']} attributed, {counts['unattributed']} unattributed, "
+          f"{counts['unverified']} claim no verification.")
+    print("An unattributed date is not evidence of anything: it cannot distinguish a person who read the")
+    print("body from a process that stamped it. Set `verified_by` when you bump `verified`.")
+    return 0
+
+
 def cmd_prescan(args) -> int:
     """Scan the manifest's [seed_sources] into ranked pointer candidates plus a captured-vs-gap report.
 
@@ -2959,6 +3030,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--repo", default=".", help="KB repo root to audit (default: current dir)")
     sp.add_argument("--json", action="store_true", help="emit the full report as JSON")
     sp.set_defaults(func=cmd_pin_audit)
+
+    sp = sub.add_parser("verify-audit",
+                        help="report nuggets asserting a verified date that names no verifier")
+    sp.add_argument("--repo", default=".", help="KB repo root to audit (default: current dir)")
+    sp.add_argument("--json", action="store_true", help="emit the full report as JSON")
+    sp.set_defaults(func=cmd_verify_audit)
 
     sp = sub.add_parser("prescan",
                         help="scan the manifest's seed sources into ranked pointer candidates (secrets-safe)")

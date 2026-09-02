@@ -23,6 +23,7 @@ attested_by: <asana-user-gid>  # for provenance_type: attestation. The person wh
 attested_on: <YYYY-MM-DD>      # for attestation, ISO-8601 date (UTC)
 confidence: low | medium | high
 verified: <YYYY-MM-DD | unverified>   # last human verification; ISO-8601 UTC
+verified_by: <asana-user-gid>  # OPTIONAL for now: the person who did that verification. See below
 supersedes: <id | null>        # the id this nugget replaces, if any
 related: [<id>, ...]           # companion nuggets, by id (relative links)
 tags: [<tag>, ...]
@@ -91,6 +92,37 @@ hit answer (from the interaction log), or `null` until any usage is seen. It car
 signal to the hygiene sweep, which holds back the Outdated flag for a nugget used inside the usage window
 until a hard ceiling age. It is never a substitute for `verified`: usage is not human confirmation, so
 `verified` stays a human-only field and a nugget past the ceiling is flagged regardless of use.
+
+## `verified_by`: who did the verifying, and why a bare date could not say
+
+`verified` records WHEN. On its own it cannot record WHETHER. A date written after a person read the body
+against its source, and a date written by a process that read nothing, are **byte-identical**, so the
+unearned one is indistinguishable from the earned one for ever.
+
+The hygiene sweep cannot close that gap, and it is worth being precise about why. `rot` flags a date for
+being too OLD. Nothing anywhere flags a date for being unearned, because there is nothing in the record to
+flag. The error detection is therefore **one-directional by construction**:
+
+- an **under-claimed** date (older than the truth) gets the nugget flagged and re-read, so it self-corrects;
+- an **over-claimed** date (newer than the truth) suppresses the flag for `ROT_OUTDATED_DAYS` and is simply
+  believed, so it does not.
+
+Only one of the two errors corrects itself, which is why every tie breaks toward leaving the field alone,
+and why the fix is to record the verifier rather than to write better guidance about when to bump.
+
+`verified_by` names the person. It is **optional for now**, deliberately: every nugget that exists predates
+the field, and nobody can honestly backfill who verified them, so requiring it immediately would force
+either a mass grandfather or a mass re-read. The staged path is additive-first:
+
+1. **Now.** The field is optional. `kb.py verify-audit` reports every nugget claiming a `verified` date
+   while naming nobody. `validate_entry` checks coherence only (`verified_by` set with no date is refused)
+   and refuses nothing that exists today.
+2. **Next.** New and re-verified nuggets carry `verified_by`, so the unattributed count falls as real
+   verifications happen rather than through a migration.
+3. **Then.** Once `verify-audit` reports a workable remainder, `validate_entry` starts refusing a dated
+   `verified` with no `verified_by`, and this section records that the flip has happened.
+
+Until step 3, read an unattributed `verified` date as what it is: a claim with nobody behind it.
 
 Each data repo's published `registry.json` is its **audience slice**, not a self-only listing: the manager
 derives it from the private cross-audience aggregate per the manifest `[audiences]` map, so a repo carries the
