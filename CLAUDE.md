@@ -64,6 +64,68 @@ default, not optional, and hold even where a task prompt does not restate them.
   exception that needs alignment first.
 <!-- END kacific:agent-practices -->
 
+## First pull (bootstrap)
+
+Everything below is generic on purpose. This repo is public and carries no deployment specifics, so a first
+pull gets you a working tool and a passing test suite, and the private control home supplies the rest.
+
+**Prerequisites.** Python 3 and git. No third-party packages, no virtualenv, no install step: `kb.py` is
+stdlib only. The core subcommands (`store`, `index`, `answer`, `rot`) run on **any Python 3**. The
+config-dependent ones need **3.11+** for stdlib `tomllib`, or the `tomli` backport on an older interpreter.
+That split is deliberate, so do not move config parsing into a core command.
+
+**Shortest path to a verified first run**, needing no config and no data repo:
+
+```
+git clone <this repo> && cd <this repo>
+python3 tests/run_acceptance.py
+```
+
+Working looks like a final line reading `N/N checks passed` and exit status 0. It builds its own fixtures in
+a temp directory and touches nothing else, so it is safe on a fresh machine. `python3 kb.py --help` lists the
+subcommands.
+
+**Configuration.** Copy `config.example.toml` to `config.toml` and fill it in. `config.toml` is gitignored
+and is the only place deployment specifics live: the managed data repos, the tracking workspace, and where
+credentials are read from. **Credentials are referenced by LOCATION, never by value**, in the config, in this
+file, and in any commit. Nothing here needs a secret to run the test suite.
+
+**Related repos.** This repo is the control plane only; the knowledge itself lives in separate data repos
+that `config.toml`'s manifest names. You do not need any of them cloned to run the tests or to validate a
+nugget. You do need one to run `store --into` or `index` against real content. The manifest is the graph, so
+read it rather than guessing repo names, and note the write-path guard below expects those repos to carry the
+same managed concurrency block this file does.
+
+**One optional runtime dependency, added 2026-09-02, and its absence is a designed state.** `store` carries a
+two-part write-path guard. The refusing half (never write into a shared main checkout of a repo governed by
+the managed concurrency block above) is pure stdlib in `kb.py` and always works, on any clone, with nothing
+configured. The warning half (another live session is working in the destination worktree) needs a helper
+that reads the local machine's session store, which no clone carries and no CI has. It is found through the
+**`KACIFIC_ESTATE_LIB`** environment variable, pointing at the directory holding `worktree_guard.py`:
+
+- **unset**, which is every cold clone and every CI run: the occupancy check does not run and says nothing.
+  This is not a degraded state, it is the expected one off the operator's machine.
+- **set but unusable**: `store` prints a named note saying the check did not run, and proceeds. It reports a
+  could-not-look rather than an all-clear, because those must never read the same.
+
+Neither case can stop a write that would otherwise succeed, and no part of the guard is a git hook.
+
+**`store` exit codes**, since a caller needs to tell these apart and two of them are not the guard's:
+
+| Code | Meaning |
+|---|---|
+| `0` | stored, or validated when no `--into` was given |
+| `1` | refused by the schema or anti-hallucination gate |
+| `2` | argparse usage error, not a refusal. Owned by argparse, listed so nothing else claims it |
+| `4` | refused by the guard: the destination is a shared main checkout of a governed repo |
+| `5` | refused by the guard: it could not determine whether the destination was safe |
+
+`5` is a **could-not-look**, never an all-clear, and it is deliberately distinct from `4`. It covers git
+being absent, a governance file that exists but will not read, a git too old to answer the worktree
+question, and a destination inside a `.git` directory. Do not "simplify" any of those into an allow: a
+guard that reports success on a question it never managed to ask is worse than no guard, because it is
+believed.
+
 ## Role
 
 The KB manager stores and provides the estate's sources of truth. One SSOT per fact; everything else is a
