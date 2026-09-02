@@ -1005,6 +1005,30 @@ def prescan_looks_truncated_catches_dangling_words_not_missing_stops():
 
 
 @check
+def prescan_guard_allows_sentence_final_particles_and_quantifiers():
+    """A word that can end a sentence must not be treated as dangling, or the fail-safe eats true abstracts.
+
+    Found on the real corpus, not imagined: the first draft of the word list carried on, one, this and such,
+    so three otherwise perfect abstracts were rejected and published as pointer lines instead. In a fail-safe
+    a false positive is the expensive direction, since it destroys prose the source really does support.
+    """
+    endings = [
+        "This repo has no docs/adr/ tree, so this follows the existing convention rather than inventing one.",
+        "This page is a signpost to legwork already done that the reverse-engineering task should build on.",
+        "Nothing else in the pipeline depends on it, so the safe move is to turn the scheduled job off.",
+        "The rendered bundle is generated, never hand-written; do not edit it directly, generate it like this.",
+        "Two sites remain on the legacy path and the migration plan covers both.",
+    ]
+    wrongly_flagged = [e for e in endings if kb._looks_truncated(e)]
+    # The genuinely-dangling tails the brief named must still be caught, or this test has merely gone blind.
+    still_caught = [f for f in ("Sessions read these files first rather.", "One of the ops repos, sibling to.",
+                                "Inspects the board, writes a.", "Aggregates them with.", "Per the.")
+                    if kb._looks_truncated(f)]
+    return not wrongly_flagged and len(still_caught) == 5, \
+        f"wrongly_flagged={wrongly_flagged} still_caught={len(still_caught)} of 5"
+
+
+@check
 def prescan_sentence_split_holds_on_estate_prose():
     """Conservative splitting: abbreviations, file extensions and version numbers are not sentence ends."""
     cases = {

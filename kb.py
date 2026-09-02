@@ -1852,14 +1852,24 @@ _ABSTRACT_HARD_MAX_CHARS = 2 * _ABSTRACT_MAX_CHARS
 
 # Tokens that cannot end an English sentence. A cut abstract reads as finished because a terminator was
 # appended to it, so "does it end with a full stop" scores a fragment clean; the dangling word is the tell.
+#
+# This is a BACKSTOP, not the mechanism. Whole-sentence selection is what prevents a cut; measured against
+# the 68 fragments the old rule actually shipped, this catches 18, because a cut lands on a content word as
+# often as on a function word ("holds copied training.", "and exposes.") and no word-list can see that.
+# Read a clean result as "no dangling word", never as "not truncated".
+#
+# Deliberately EXCLUDED, though a cut does land on them: particles and quantifiers that legitimately end a
+# sentence ("this follows the existing convention rather than inventing one.", "legwork that #7 should build
+# on.", "like this."). Including them cost more than it bought. On the real corpus the wider list false-flagged
+# 5 of 69 complete bodies, and in a fail-safe a false positive destroys a true abstract and publishes a
+# pointer line in its place, so the two extra catches were not worth three good abstracts.
 _DANGLING_TAIL_WORDS = frozenset("""
-a an the and or but nor so yet if when while whilst because although though since unless until whether
-that which who whom whose where what how why this these those some any each every both either neither
-of to in on at by for with within without from into onto upon over under above below via per across
-against between among during before after about around through throughout toward towards than as like
+a an the and or but nor if while whilst because although though since unless until whether
+that which who whom whose every
+of to for with within without from into onto upon via per across
+against between among during throughout toward towards than as like
 is are was were be been being am has have had do does did will would shall should can could may might
-must not no also however moreover therefore thus hence rather instead just only even still already
-its their our your his her my out up off down more most less least such one two three few many several
+must however moreover therefore thus hence rather
 """.split())
 
 _SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
@@ -1909,9 +1919,13 @@ def _looks_truncated(text: str) -> bool:
     """True when text reads as cut mid-sentence, whatever punctuation was appended to it.
 
     Deliberately NOT a "does it end with a terminator" check: the defect this guards against appended a
-    full stop to a fragment, so a terminator check scores it clean. The dangling function word is the
-    signal. Biased toward catching: a false positive costs one informative abstract and falls back to a
-    true pointer line, while a false negative publishes a sentence that says something the source does not.
+    full stop to a fragment, so a terminator check scores it clean. The dangling function word is the signal.
+
+    Partial by nature, and a BACKSTOP rather than the mechanism: whole-sentence selection is what prevents a
+    cut. Measured against the 68 fragments the old rule actually shipped, this catches 18, because a cut
+    lands on a content word as often as on a function word. False means "no dangling word", never "not
+    truncated". Tuned instead for no false positives on real prose, since in a fail-safe a false positive
+    destroys a true abstract and publishes a pointer line in its place.
     """
     stripped = str(text or "").strip()
     if not stripped:
