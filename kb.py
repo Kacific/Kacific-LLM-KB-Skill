@@ -2223,6 +2223,18 @@ def audit_pin_row(meta: dict, body: str, source_text: str | None) -> dict:
     An `ok` verdict means nothing contradicted the source. It does NOT mean the body is true, and it cannot:
     the source itself may be wrong.
     """
+    parts = parse_source_url(meta.get("source", ""))
+    if parts and not parts["pinned"]:
+        # Real finding, and it outranks whether the fetch worked: a moving ref follows the file forward, so
+        # the body can never be audited for drift against it and the pointer is not actually a pin.
+        return {"id": meta.get("id"), "verdict": "unpinned-ref",
+                "detail": f"source points at ref {parts['ref']!r}, not a fixed SHA"}
+    if parts and parts["kind"] == "tree":
+        return {"id": meta.get("id"), "verdict": "directory-pointer",
+                "detail": "pin is sound; a directory has no body to compare"}
+    if parts is None and str(meta.get("source", "")).startswith("http"):
+        return {"id": meta.get("id"), "verdict": "external-pointer",
+                "detail": "points outside GitHub; not auditable here and not a defect"}
     if source_text is None:
         return {"id": meta.get("id"), "verdict": "unfetchable", "detail": "pinned blob could not be read"}
     stored = str(body or "").strip()
@@ -2235,11 +2247,10 @@ def audit_pin_row(meta: dict, body: str, source_text: str | None) -> dict:
                           f"{'/'.join(sorted(closed_now))}"}
     if "prescan" not in (meta.get("tags") or []):
         return {"id": meta.get("id"), "verdict": "ok", "detail": "hand-written body; status-checked only"}
-    # Repo-relative path, taken from the blob URL itself. Not from _norm_source, whose "github:owner/repo/path"
-    # form keeps the repo segment; prescan builds the abstract from the repo-relative path, so borrowing the
-    # normalised form would put an extra segment into every pointer line and report it as drift.
-    m = re.match(r"https://github\.com/[^/]+/[^/]+/blob/[^/]+/(.+)$", str(meta.get("source", "")))
-    relpath = urllib.parse.unquote(m.group(1)) if m else str(meta.get("source", ""))
+    # Repo-relative path from the parsed URL, fragment already stripped. Not from _norm_source, whose
+    # "github:owner/repo/path" form keeps the repo segment; prescan builds the abstract from the
+    # repo-relative path, so borrowing the normalised form puts an extra segment into every pointer line.
+    relpath = urllib.parse.unquote(parts["path"]) if parts else str(meta.get("source", ""))
     is_md = relpath.lower().endswith(".md")
     _title, raw = _extract_title_abstract(source_text, relpath.rsplit("/", 1)[-1], is_md)
     regenerated = _candidate_abstract(raw, relpath, _seed_key_of(meta))
@@ -2249,12 +2260,29 @@ def audit_pin_row(meta: dict, body: str, source_text: str | None) -> dict:
                                                                   "needs a human read, not a regeneration"}
 
 
-def _fetch_pinned_source(source_url: str, token: str | None) -> str | None:
-    """Read a GitHub blob URL pinned at a fixed SHA. Replaced wholesale by the tests; the only network here."""
-    m = re.match(r"https://github\.com/([^/]+)/([^/]+)/blob/([0-9a-f]{7,40})/(.+)$", str(source_url or ""))
+def parse_source_url(source_url: str) -> dict | None:
+    """Split a GitHub blob/tree URL into its parts, or None when it is not one.
+
+    The `#fragment` is stripped from the path and kept separately. A pointer may legitimately aim at one
+    section of a file, and a fragment is not part of the path: leaving it on asks the API for a file whose
+    name ends "...md#8a-section-name-with--a-double-hyphen", which 404s and reads as a dead pin. That is
+    not hypothetical, it reported two sound pointers as broken provenance.
+    """
+    m = re.match(r"https://github\.com/([^/]+)/([^/]+)/(blob|tree)/([^/]+)/(.+)$", str(source_url or ""))
     if not m:
         return None
-    owner, repo, ref, path = m.groups()
+    owner, repo, kind, ref, path = m.groups()
+    path, _, fragment = path.partition("#")
+    return {"owner": owner, "repo": repo, "kind": kind, "ref": ref, "path": path,
+            "fragment": fragment, "pinned": bool(re.fullmatch(r"[0-9a-f]{7,40}", ref))}
+
+
+def _fetch_pinned_source(source_url: str, token: str | None) -> str | None:
+    """Read a GitHub blob URL. Replaced wholesale by the tests; the only network in the pin audit."""
+    parts = parse_source_url(source_url)
+    if not parts or parts["kind"] != "blob" or not parts["path"]:
+        return None
+    owner, repo, ref, path = parts["owner"], parts["repo"], parts["ref"], parts["path"]
     url = (f"https://api.github.com/repos/{owner}/{repo}/contents/{urllib.parse.quote(path)}"
            f"?ref={urllib.parse.quote(ref)}")
     headers = {"Accept": "application/vnd.github.raw", "User-Agent": "kb.py-pin-audit"}
@@ -2282,14 +2310,18 @@ def cmd_pin_audit(args) -> int:
         if meta.get("provenance_type") != "reference" or not str(meta.get("source", "")).startswith("http"):
             continue
         rows.append(audit_pin_row(meta, n["body"], _fetch_pinned_source(meta["source"], token)))
-    counts = {v: sum(1 for r in rows if r["verdict"] == v) for v in
-              ("ok", "stale-status", "diverged", "unfetchable")}
+    verdicts = ("ok", "stale-status", "diverged", "unpinned-ref", "directory-pointer",
+                "external-pointer", "unfetchable")
+    counts = {v: sum(1 for r in rows if r["verdict"] == v) for v in verdicts}
     if args.json:
         print(json.dumps({"counts": counts, "rows": rows}, indent=2))
     else:
         for verdict, label in (("stale-status", "SEVERE: body publishes an open status its source has closed"),
+                               ("unpinned-ref", "source is not pinned to a fixed SHA, so drift is unauditable"),
                                ("diverged", "needs a human read (a hand-improved body looks like this too)"),
-                               ("unfetchable", "pinned blob unreadable; nothing claimed")):
+                               ("unfetchable", "pinned blob unreadable; nothing claimed"),
+                               ("directory-pointer", "sound pin, no body to compare"),
+                               ("external-pointer", "outside GitHub, not auditable here")):
             hits = [r for r in rows if r["verdict"] == verdict]
             if not hits:
                 continue
