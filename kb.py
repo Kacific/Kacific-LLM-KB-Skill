@@ -2265,7 +2265,7 @@ def parse_source_url(source_url: str) -> dict | None:
 
     The `#fragment` is stripped from the path and kept separately. A pointer may legitimately aim at one
     section of a file, and a fragment is not part of the path: leaving it on asks the API for a file whose
-    name ends "...md#8a-paired-director--team-raci-vocabulary", which 404s and reads as a dead pin. That is
+    name ends "...md#8a-section-name-with--a-double-hyphen", which 404s and reads as a dead pin. That is
     not hypothetical, it reported two sound pointers as broken provenance.
     """
     m = re.match(r"https://github\.com/([^/]+)/([^/]+)/(blob|tree)/([^/]+)/(.+)$", str(source_url or ""))
