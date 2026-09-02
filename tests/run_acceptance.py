@@ -1227,6 +1227,47 @@ def pin_audit_separates_an_unpinned_ref_from_an_unreadable_one():
         f"moving={row['verdict']!r} tree={dir_ok} external={ext_ok} unfetchable={dead_ok}"
 
 
+@check
+def pin_audit_report_states_its_own_scope():
+    """The report must name the clone it covered and say it covers only that one.
+
+    The command takes a single --repo while the KB spans several audience repos, so a clean result reads as
+    an estate-wide clean bill unless the output says otherwise. It did not, and three pointers on a moving
+    ref sat unnoticed for a day behind a clean Technical run because nobody had pointed it at AllStaff.
+    Runs the real CLI, so it fails if the wording is dropped from either the header or the closing line.
+    """
+    p = run("pin-audit", "--repo", str(FIXTURE_KB))
+    out = p.stdout
+    names_repo = FIXTURE_KB.name in out
+    says_scope = "pin-audit scope:" in out
+    # The caveat has to appear where a reader lands: at the top AND next to the result they will quote.
+    caveat_at_top = "THIS CLONE ONLY" in out.split("pin-audit:")[0]
+    caveat_at_end = "not a clean KB" in out.rsplit("pin-audit:", 1)[-1]
+    counts_shown = "nuggets scanned" in out and "of them pointers" in out
+    # The fixture's two pointers are external, so they are unCHECKABLE, not failures. Reporting only the ok
+    # count rendered that as "0 matching their source", which reads as two broken pointers.
+    unchecked_split = "could not be checked here" in out and "2 could not be checked here" in out
+    ok = (p.returncode == 0 and names_repo and says_scope and caveat_at_top
+          and caveat_at_end and counts_shown and unchecked_split)
+    return ok, (f"rc={p.returncode} names_repo={names_repo} scope={says_scope} top={caveat_at_top} "
+                f"end={caveat_at_end} counts={counts_shown} unchecked={unchecked_split}")
+
+
+@check
+def pin_audit_json_carries_the_scope_too():
+    """A machine reader needs the scope as data, not only in the prose a human sees."""
+    p = run("pin-audit", "--repo", str(FIXTURE_KB), "--json")
+    doc = json.loads(p.stdout)
+    scope = doc.get("scope", {})
+    has_keys = {"repo", "audience", "path", "nuggets_scanned", "pointers_audited", "covers"} <= set(scope)
+    right_repo = scope.get("repo") == FIXTURE_KB.name and scope.get("path") == str(FIXTURE_KB.resolve())
+    counted = scope.get("nuggets_scanned", 0) >= scope.get("pointers_audited", -1) >= 0
+    # Scope must not be conjured when there is nothing to report; it describes the run, not the findings.
+    still_has_counts = "counts" in doc and "rows" in doc
+    ok = p.returncode == 0 and has_keys and right_repo and counted and still_has_counts
+    return ok, f"has_keys={has_keys} right_repo={right_repo} counted={counted} scope={scope}"
+
+
 # --- audience slicing -------------------------------------------------------
 
 def _slice_aggregate() -> dict:
