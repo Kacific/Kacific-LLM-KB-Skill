@@ -2202,7 +2202,39 @@ def _seed_key_of(meta: dict) -> str:
     return str(meta.get("domain") or "seed")
 
 
-def audit_pin_row(meta: dict, body: str, source_text: str | None) -> dict:
+def audit_tree_row(meta: dict, tree_names: tuple | None) -> dict:
+    """Classify a DIRECTORY pin by what the directory now holds. Pure; no network, no clock.
+
+    A `/tree/<sha>/` pointer aims at a directory, so there is no single blob to diff and the audit used to
+    call it sound and move on. That is the wrong conclusion: a directory pin goes stale exactly as a blob
+    pin does, by its CONTENTS changing, and nothing else in this file could see it. Two such pins existed
+    when this was written and neither had ever been checked by anything; one was serving a twelve-ADR view
+    of a thirty-six-ADR set, so two thirds of the decisions were invisible to every reader of the KB.
+
+    Membership, not count. Comparing lengths alone reports nothing when one file is added and another
+    removed in the same window, which is the ordinary shape of a renumber.
+
+    `tree_names` is (names_at_pin, names_on_head); None means the listing could not be read, which is
+    reported as could-not-look rather than as agreement.
+    """
+    if not tree_names:
+        return {"id": meta.get("id"), "verdict": "unfetchable",
+                "detail": "directory listing could not be read at the pin or on the default branch"}
+    pinned, head = (set(tree_names[0] or ()), set(tree_names[1] or ()))
+    added, gone = sorted(head - pinned), sorted(pinned - head)
+    if not added and not gone:
+        return {"id": meta.get("id"), "verdict": "ok",
+                "detail": f"directory membership unchanged, {len(pinned)} entries"}
+    bits = [f"{len(pinned)} entries at the pin, {len(head)} on the default branch"]
+    if added:
+        bits.append(f"{len(added)} added: " + ", ".join(added[:4]) + (" ..." if len(added) > 4 else ""))
+    if gone:
+        bits.append(f"{len(gone)} removed: " + ", ".join(gone[:4]) + (" ..." if len(gone) > 4 else ""))
+    return {"id": meta.get("id"), "verdict": "stale-tree", "detail": "; ".join(bits)}
+
+
+def audit_pin_row(meta: dict, body: str, source_text: str | None,
+                  tree_names: tuple | None = None) -> dict:
     """Classify one pointer nugget against the text of its own pinned source. Pure; no network, no clock.
 
     Verdicts:
@@ -2230,8 +2262,7 @@ def audit_pin_row(meta: dict, body: str, source_text: str | None) -> dict:
         return {"id": meta.get("id"), "verdict": "unpinned-ref",
                 "detail": f"source points at ref {parts['ref']!r}, not a fixed SHA"}
     if parts and parts["kind"] == "tree":
-        return {"id": meta.get("id"), "verdict": "directory-pointer",
-                "detail": "pin is sound; a directory has no body to compare"}
+        return audit_tree_row(meta, tree_names)
     if parts is None and str(meta.get("source", "")).startswith("http"):
         return {"id": meta.get("id"), "verdict": "external-pointer",
                 "detail": "points outside GitHub; not auditable here and not a defect"}
@@ -2295,6 +2326,53 @@ def _fetch_pinned_source(source_url: str, token: str | None) -> str | None:
         return None
 
 
+def _fetch_tree_names(source_url: str, token: str | None) -> tuple | None:
+    """List a pinned directory's entries at the pin and on the default branch. Network; replaced by tests.
+
+    Two calls, deliberately: the pin tells you what the pointer promised and the default branch tells you
+    what a reader would find today, and the audit is the difference. Asking only one side answers nothing.
+
+    Returns None when EITHER side is unreadable, so a permission or rate-limit failure is reported as
+    could-not-look. Returning a partial pair would let a failed fetch masquerade as an emptied directory,
+    which is the loudest possible false positive.
+    """
+    parts = parse_source_url(source_url)
+    if not parts or parts["kind"] != "tree" or not parts["path"]:
+        return None
+    owner, repo, path = parts["owner"], parts["repo"], parts["path"]
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "kb.py-pin-audit"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    def listing(ref: str):
+        url = (f"https://api.github.com/repos/{owner}/{repo}/contents/{urllib.parse.quote(path)}"
+               f"?ref={urllib.parse.quote(ref)}")
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as resp:
+                payload = json.loads(resp.read().decode("utf-8", "replace"))
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError):
+            return None
+        if not isinstance(payload, list):  # a file, not a directory
+            return None
+        return sorted(e.get("name", "") for e in payload if e.get("type") == "file")
+
+    at_pin = listing(parts["ref"])
+    on_head = listing(_default_branch(owner, repo, headers))
+    if at_pin is None or on_head is None:
+        return None
+    return (at_pin, on_head)
+
+
+def _default_branch(owner: str, repo: str, headers: dict) -> str:
+    """The repo's default branch, asked rather than assumed; not every repo here is on `main`."""
+    try:
+        url = f"https://api.github.com/repos/{owner}/{repo}"
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace")).get("default_branch") or "main"
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError):
+        return "main"
+
+
 def cmd_pin_audit(args) -> int:
     """Report pointer nuggets whose body no longer matches the source they pin. Report-only; never writes.
 
@@ -2309,14 +2387,20 @@ def cmd_pin_audit(args) -> int:
         meta = n["meta"]
         if meta.get("provenance_type") != "reference" or not str(meta.get("source", "")).startswith("http"):
             continue
-        rows.append(audit_pin_row(meta, n["body"], _fetch_pinned_source(meta["source"], token)))
-    verdicts = ("ok", "stale-status", "diverged", "unpinned-ref", "directory-pointer",
+        parts = parse_source_url(meta["source"])
+        if parts and parts["kind"] == "tree" and parts["pinned"]:
+            rows.append(audit_pin_row(meta, n["body"], None,
+                                      tree_names=_fetch_tree_names(meta["source"], token)))
+        else:
+            rows.append(audit_pin_row(meta, n["body"], _fetch_pinned_source(meta["source"], token)))
+    verdicts = ("ok", "stale-status", "stale-tree", "diverged", "unpinned-ref", "directory-pointer",
                 "external-pointer", "unfetchable")
     counts = {v: sum(1 for r in rows if r["verdict"] == v) for v in verdicts}
     if args.json:
         print(json.dumps({"counts": counts, "rows": rows}, indent=2))
     else:
         for verdict, label in (("stale-status", "SEVERE: body publishes an open status its source has closed"),
+                               ("stale-tree", "SEVERE: a pinned DIRECTORY has gained or lost files since the pin"),
                                ("unpinned-ref", "source is not pinned to a fixed SHA, so drift is unauditable"),
                                ("diverged", "needs a human read (a hand-improved body looks like this too)"),
                                ("unfetchable", "pinned blob unreadable; nothing claimed"),

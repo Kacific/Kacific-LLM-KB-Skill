@@ -1123,6 +1123,34 @@ def pin_audit_does_not_report_hand_written_bodies_as_drift_forever():
 
 
 @check
+def pin_audit_sees_a_directory_pin_going_stale():
+    """A /tree/<sha>/ pointer stales by its CONTENTS changing, and nothing here could see it before.
+
+    Two such pins existed when this was written and neither had ever been checked by any sweep, because
+    every check matched /blob/. One was serving a twelve-ADR view of a thirty-six-ADR set, so two thirds
+    of the decisions were invisible to every reader of the KB. The earlier audit called a directory pin
+    "sound, no body to compare", which is true of the body and false of the pin.
+
+    Membership, not count: a renumber that adds one file and removes another leaves the length identical
+    while the directory is materially different, so a length check would pass it.
+    """
+    meta = {"id": "adrs", "source": "https://github.com/o/r/tree/" + "a" * 40 + "/docs/adr"}
+    twelve = [f"{i:04d}-x.md" for i in range(1, 13)]
+    thirtysix = [f"{i:04d}-x.md" for i in range(1, 37)]
+    grown = kb.audit_tree_row(meta, (twelve, thirtysix))
+    same = kb.audit_tree_row(meta, (twelve, list(twelve)))
+    swapped = kb.audit_tree_row(meta, (twelve, twelve[:-1] + ["0099-renamed.md"]))
+    cannot_look = kb.audit_tree_row(meta, None)
+    return (grown["verdict"] == "stale-tree"
+            and "24 added" in grown["detail"]
+            and same["verdict"] == "ok"
+            and swapped["verdict"] == "stale-tree"          # equal length, different membership
+            and cannot_look["verdict"] == "unfetchable",     # never silently "agreed"
+            f"grown={grown['verdict']} same={same['verdict']} swapped={swapped['verdict']} "
+            f"unreadable={cannot_look['verdict']}")
+
+
+@check
 def pin_audit_status_words_come_from_status_lines_not_loose_prose():
     """Scoped to status lines: prose says "done" and "pending" in passing and must not trip the severe flag."""
     meta = {"id": "seed-y", "tags": ["prescan"], "domain": "technical",
@@ -1171,6 +1199,8 @@ def pin_audit_strips_the_url_fragment_before_asking_for_the_file():
 def pin_audit_separates_an_unpinned_ref_from_an_unreadable_one():
     """A source on `main` is a real finding, not a fetch failure, and must not hide in `unfetchable`.
 
+    Also pins the directory-pin behaviour that replaced `directory-pointer`; see the comment inline.
+
     The two are opposite in meaning: an unreadable blob claims nothing, while a moving ref means the pointer
     is not a pin at all and drift against it can never be audited. Lumping them lost that distinction.
     """
@@ -1179,9 +1209,13 @@ def pin_audit_separates_an_unpinned_ref_from_an_unreadable_one():
     # Reported even though the fetch SUCCEEDED, because the defect is the ref, not the read.
     row = kb.audit_pin_row(moving, "body", "# A\n\nSome text.\n")
     flagged = row["verdict"] == "unpinned-ref" and "main" in row["detail"]
-    # A directory pin is sound and simply has no body to compare; it is not a defect and not unfetchable.
+    # A directory pin USED to return "directory-pointer" here, on the reasoning that it is sound because it
+    # has no body to compare. That conflated the body with the pin: a directory pin stales by its contents
+    # changing, and calling it sound is how a twelve-of-thirty-six ADR view went unseen. It is now audited
+    # by membership, so with no listing available the honest verdict is could-not-look, not sound.
     tree = {"id": "seed-b", "tags": [], "source": "https://github.com/o/r/tree/" + "b" * 40 + "/docs/adr"}
-    dir_ok = kb.audit_pin_row(tree, "body", None)["verdict"] == "directory-pointer"
+    dir_ok = (kb.audit_pin_row(tree, "body", None)["verdict"] == "unfetchable"
+              and kb.audit_pin_row(tree, "body", None, tree_names=(["a.md"], ["a.md"]))["verdict"] == "ok")
     # A non-GitHub source is likewise not auditable and not a defect.
     ext = kb.audit_pin_row({"id": "c", "tags": [], "source": "https://crt.sh/"}, "body", None)
     ext_ok = ext["verdict"] == "external-pointer"
