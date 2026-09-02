@@ -1588,6 +1588,43 @@ def store_refuses_a_named_verifier_against_a_null_date():
 
 
 @check
+def audits_refuse_a_repo_path_that_does_not_exist():
+    # An audit's whole output is an absence of findings, so a typo'd --repo walking nothing and exiting 0
+    # returns "could not look" dressed as "nothing wrong". Both audit commands must say so instead.
+    missing = str(Path(tempfile.gettempdir()) / "kb-no-such-repo-xyz")
+    pa = run("pin-audit", "--repo", missing)
+    va = run("verify-audit", "--repo", missing)
+    ok = pa.returncode == 2 and va.returncode == 2 and "no such repo" in (pa.stderr + va.stderr).lower()
+    return ok, f"pin-audit rc={pa.returncode} verify-audit rc={va.returncode}"
+
+
+@check
+def verify_audit_prints_the_readable_verifier_when_there_is_one():
+    # A bare gid in a human report is a 16-digit number handed to the person expected to act on it.
+    with tempfile.TemporaryDirectory() as d:
+        _write(Path(d) / "shared" / "n.md",
+               _nugget(id="named-verifier", verified="2020-01-01",
+                       verified_by="0000000000000000", verified_by_name="Example Reviewer"))
+        p = run("verify-audit", "--repo", d, "--json")
+    row = next((r for r in json.loads(p.stdout)["rows"] if r["id"] == "named-verifier"), None)
+    ok = (row is not None and row["verdict"] == "attributed"
+          and "Example Reviewer (0000000000000000)" in row["detail"]
+          and row["verified_by_name"] == "Example Reviewer")
+    return ok, f"detail={row['detail'] if row else None}"
+
+
+@check
+def store_refuses_a_verifier_name_with_no_gid():
+    # The incoherent direction: a name identifies nobody the estate can route to.
+    with tempfile.TemporaryDirectory() as d:
+        f = _write(Path(d) / "bad.md",
+                   _nugget(verified="2020-01-01", verified_by_name="Example Reviewer"))
+        p = run("store", str(f))
+    ok = p.returncode == 1 and "REFUSED" in p.stderr and "verified_by_name" in p.stderr
+    return ok, f"rc={p.returncode} stderr={p.stderr.strip()!r}"
+
+
+@check
 def a_malformed_date_is_reported_rather_than_cleared():
     with tempfile.TemporaryDirectory() as d:
         _write(Path(d) / "shared" / "n.md", _nugget(id="typo-date", verified="2O20-01-01"))

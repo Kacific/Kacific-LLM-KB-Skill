@@ -24,6 +24,7 @@ attested_on: <YYYY-MM-DD>      # for attestation, ISO-8601 date (UTC)
 confidence: low | medium | high
 verified: <YYYY-MM-DD | unverified>   # last human verification; ISO-8601 UTC
 verified_by: <asana-user-gid>  # OPTIONAL for now: the person who did that verification. See below
+verified_by_name: <display name>   # OPTIONAL readable twin of verified_by, as owner_name is of owner_gid
 supersedes: <id | null>        # the id this nugget replaces, if any
 related: [<id>, ...]           # companion nuggets, by id (relative links)
 tags: [<tag>, ...]
@@ -123,6 +124,17 @@ either a mass grandfather or a mass re-read. The staged path is additive-first:
    `verified` with no `verified_by`, and this section records that the flip has happened.
 
 Until step 3, read an unattributed `verified` date as what it is: a claim with nobody behind it.
+
+`verified_by_name` is the optional readable twin, exactly as `owner_name` is to `owner_gid` and as
+`prescan --commit` already requires the pair for the human who owns a staged candidate. The gid is what
+identifies the person to the estate; the name is what a report can put in front of a reader, because a
+bare 16-digit number is not something anyone can act on. A name without a gid is refused: it identifies
+nobody the estate can route to. `verify-audit` prints `Name (gid)` where both are present and the gid
+alone otherwise.
+
+Note for anyone tidying: `attested_by` carries a gid with no readable twin either. That is the same gap
+in the neighbouring field, and it is deliberately left alone here rather than widened into by a change
+about `verified`.
 
 Each data repo's published `registry.json` is its **audience slice**, not a self-only listing: the manager
 derives it from the private cross-audience aggregate per the manifest `[audiences]` map, so a repo carries the
