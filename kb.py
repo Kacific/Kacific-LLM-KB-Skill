@@ -2382,8 +2382,9 @@ def cmd_pin_audit(args) -> int:
     """
     root = Path(args.repo).expanduser().resolve()
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    nuggets = _load_nuggets(root)
     rows = []
-    for n in _load_nuggets(root):
+    for n in nuggets:
         meta = n["meta"]
         if meta.get("provenance_type") != "reference" or not str(meta.get("source", "")).startswith("http"):
             continue
@@ -2396,9 +2397,18 @@ def cmd_pin_audit(args) -> int:
     verdicts = ("ok", "stale-status", "stale-tree", "diverged", "unpinned-ref", "directory-pointer",
                 "external-pointer", "unfetchable")
     counts = {v: sum(1 for r in rows if r["verdict"] == v) for v in verdicts}
+    # The report states its own scope, because the reader cannot see it in the findings. This command takes
+    # one --repo and the KB is spread over several audience repos, so a clean run here says nothing about the
+    # others. That is not a hypothetical: three pointers on a moving ref sat unnoticed for a day behind a
+    # clean Technical result, simply because nobody had run it against the AllStaff clone.
+    scope = {"repo": root.name, "audience": root.name.rsplit("-", 1)[-1], "path": str(root),
+             "nuggets_scanned": len(nuggets), "pointers_audited": len(rows), "covers": "this clone only"}
     if args.json:
-        print(json.dumps({"counts": counts, "rows": rows}, indent=2))
+        print(json.dumps({"scope": scope, "counts": counts, "rows": rows}, indent=2))
     else:
+        print(f"pin-audit scope: {scope['repo']} (audience {scope['audience']}) at {scope['path']}")
+        print(f"  {scope['nuggets_scanned']} nuggets scanned, {scope['pointers_audited']} of them pointers.")
+        print("  THIS CLONE ONLY. Sibling audience repos are not covered; run it once per repo.")
         for verdict, label in (("stale-status", "SEVERE: body publishes an open status its source has closed"),
                                ("stale-tree", "SEVERE: a pinned DIRECTORY has gained or lost files since the pin"),
                                ("unpinned-ref", "source is not pinned to a fixed SHA, so drift is unauditable"),
@@ -2412,8 +2422,14 @@ def cmd_pin_audit(args) -> int:
             print(f"\n{label}: {len(hits)}")
             for r in hits:
                 print(f"  {r['id']}" + (f"\n      {r['detail']}" if r["detail"] else ""))
-        print(f"\npin-audit: {len(rows)} pointer nuggets, {counts['ok']} matching their source.")
-        print("An 'ok' means the body matches the source it points at, never that the body is true.")
+        # Separate "checked and matched" from "could not be checked". Reporting only the ok count made two
+        # perfectly sound external pointers read as nought out of two matching, which is the same
+        # misreadable-summary problem this scope line exists to fix.
+        unchecked = counts["external-pointer"] + counts["unfetchable"]
+        print(f"\npin-audit: {len(rows)} pointer nuggets in {scope['repo']}; {counts['ok']} match their "
+              f"source, {unchecked} could not be checked here.")
+        print("An 'ok' means the body matches the source it points at, never that the body is true,")
+        print(f"and this result covers {scope['repo']} alone. A clean run here is not a clean KB.")
     return 0
 
 
