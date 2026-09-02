@@ -20,6 +20,7 @@ owner_name: <display name>
 provenance_type: reference | attestation   # MANDATORY, one or the other
 source: <path | url>           # for provenance_type: reference. A stored-doc path, an SSOT path, or a URL
 attested_by: <asana-user-gid>  # for provenance_type: attestation. The person who vouched
+attested_by_name: <display name>   # OPTIONAL readable twin of attested_by; see the note below
 attested_on: <YYYY-MM-DD>      # for attestation, ISO-8601 date (UTC)
 confidence: low | medium | high
 verified: <YYYY-MM-DD | unverified>   # last human verification; ISO-8601 UTC
@@ -132,9 +133,15 @@ bare 16-digit number is not something anyone can act on. A name without a gid is
 nobody the estate can route to. `verify-audit` prints `Name (gid)` where both are present and the gid
 alone otherwise.
 
-Note for anyone tidying: `attested_by` carries a gid with no readable twin either. That is the same gap
-in the neighbouring field, and it is deliberately left alone here rather than widened into by a change
-about `verified`.
+`attested_by_name` is the same twin for `attested_by`, and it closes what was recorded here as a known
+gap. It matters more than the `verified` one did, because `attested_by` is **reader-facing**: it is the
+citation an answer carries when a nugget has no source (`attested by ...`) and the provenance line of an
+exported document. Both were printing a bare 16-digit gid at the reader, and `_doc_provenance`'s own
+docstring already promised "a named attestation" while doing it.
+
+Both twins are optional and both refuse only the incoherent direction, a name with no gid. The gid stays
+the identity; the name is what a reader can act on. One helper, `_person`, renders `Name (gid)` for every
+surface, so the format cannot drift between the answer citation, the exported doc and `verify-audit`.
 
 Each data repo's published `registry.json` is its **audience slice**, not a self-only listing: the manager
 derives it from the private cross-audience aggregate per the manifest `[audiences]` map, so a repo carries the
