@@ -1588,6 +1588,54 @@ def store_refuses_a_named_verifier_against_a_null_date():
 
 
 @check
+def answer_citation_names_the_attester_when_there_is_a_name():
+    # The reader-facing one. With no source, an answer cites "attested by <gid>", so a person asking the
+    # KB a question was served a bare 16-digit number as the provenance of the answer.
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d) / "kb"
+        _write(repo / "shared" / "n.md",
+               _nugget(id="cited-note", source=None, provenance_type="attestation",
+                       attested_by="0000000000000000", attested_by_name="Example Engineer",
+                       attested_on="2020-01-01",
+                       _body="Reset the token from the console, then re-run the sync job to confirm."))
+        p = run("answer", "reset the token", "--repo", str(repo))
+    ok = "Example Engineer (0000000000000000)" in p.stdout
+    return ok, f"rc={p.returncode} cited={'Example Engineer (0000000000000000)' in p.stdout}"
+
+
+@check
+def exported_doc_provenance_names_the_attester():
+    # _doc_provenance takes the META dict; _nugget_dict returns the whole {meta, body, path} nugget, so
+    # passing the nugget makes it see no provenance_type and fall through to the source branch.
+    meta = _nugget_dict(provenance_type="attestation", attested_by="0000000000000000",
+                        attested_by_name="Example Engineer", attested_on="2020-01-01")["meta"]
+    line = kb._doc_provenance(meta)
+    ok = "Attested by: Example Engineer (0000000000000000)" in line
+    return ok, f"line={line!r}"
+
+
+@check
+def store_refuses_an_attester_name_with_no_gid():
+    with tempfile.TemporaryDirectory() as d:
+        f = _write(Path(d) / "bad.md",
+                   _nugget(provenance_type="reference", source="runbooks/x.md",
+                           attested_by=None, attested_on=None,
+                           attested_by_name="Example Engineer"))
+        p = run("store", str(f))
+    ok = p.returncode == 1 and "REFUSED" in p.stderr and "attested_by_name" in p.stderr
+    return ok, f"rc={p.returncode} stderr={p.stderr.strip()!r}"
+
+
+@check
+def person_helper_degrades_to_whichever_half_exists():
+    # One helper for every surface, so the format cannot drift between them.
+    cases = [(("123", "Ann"), "Ann (123)"), (("123", None), "123"), (("123", "  "), "123"),
+             ((None, "Ann"), "Ann"), ((None, None), "")]
+    bad = [(a, kb._person(*a), want) for a, want in cases if kb._person(*a) != want]
+    return not bad, f"mismatches={bad}"
+
+
+@check
 def audits_refuse_a_repo_path_that_does_not_exist():
     # An audit's whole output is an absence of findings, so a typo'd --repo walking nothing and exiting 0
     # returns "could not look" dressed as "nothing wrong". Both audit commands must say so instead.

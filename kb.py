@@ -154,8 +154,8 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 
 _FM_FIELD_ORDER = [
     "schema_version", "id", "title", "domain", "type", "status", "owner_gid", "owner_name",
-    "provenance_type", "source", "attested_by", "attested_on", "confidence", "verified",
-    "verified_by", "verified_by_name",
+    "provenance_type", "source", "attested_by", "attested_by_name", "attested_on", "confidence",
+    "verified", "verified_by", "verified_by_name",
     "supersedes", "related", "tags",
 ]
 
@@ -192,6 +192,20 @@ def _as_list(value) -> list:
     if isinstance(value, list):
         return value
     return [value]
+
+
+def _person(gid, name) -> str:
+    """Render an identity for a human: `Name (gid)` where both exist, else whichever there is.
+
+    One helper rather than a copy per surface. A gid identifies the person to the estate and a name is
+    what a reader can act on, and the two display sites for an attestation (the answer citation and the
+    exported doc's provenance line) were each printing a bare 16-digit number at the reader.
+    """
+    gid = "" if gid is None else str(gid).strip()
+    name = "" if name is None else str(name).strip()
+    if gid and name:
+        return f"{name} ({gid})"
+    return name or gid
 
 
 def _iso_date(value) -> datetime | None:
@@ -245,6 +259,8 @@ def validate_entry(meta: dict, body: str) -> list[str]:
     # estate can route to.
     if meta.get("verified_by_name") and not meta.get("verified_by"):
         errors.append("verified_by_name is set without verified_by; the gid is what identifies the person")
+    if meta.get("attested_by_name") and not meta.get("attested_by"):
+        errors.append("attested_by_name is set without attested_by; the gid is what identifies the person")
 
     # Voice gate: no em-dashes anywhere in the human-readable content.
     if "—" in body or "—" in str(meta.get("title", "")):
@@ -749,7 +765,11 @@ def cmd_answer(args) -> int:
 
     def _cite(n: dict) -> str:
         m = n["meta"]
-        return m.get("source") or (f"attested by {m.get('attested_by')}" if m.get("attested_by") else m["id"])
+        if m.get("source"):
+            return m["source"]
+        if m.get("attested_by"):
+            return f"attested by {_person(m.get('attested_by'), m.get('attested_by_name'))}"
+        return m["id"]
 
     if args.format == "json":
         payload = {
@@ -2531,10 +2551,10 @@ def cmd_verify_audit(args) -> int:
         # never made. Both were live until an adversarial review found them.
         raw = "" if meta.get("verified") is None else str(meta["verified"]).strip()
         who = "" if meta.get("verified_by") is None else str(meta["verified_by"]).strip()
-        # Print the readable twin where there is one. A bare gid in a human report is a 16-digit number
-        # handed to the person expected to act on it.
+        # Print the readable twin where there is one, via the shared `_person` helper so the identity
+        # format has one home rather than a copy per surface.
         who_name = "" if meta.get("verified_by_name") is None else str(meta["verified_by_name"]).strip()
-        shown = f"{who_name} ({who})" if (who and who_name) else who
+        shown = _person(who, who_name)
         if raw in ("", "unverified"):
             verdict, detail = "unverified", "claims no verification, so nothing to attribute"
         elif _iso_date(raw) is None:
@@ -2739,7 +2759,7 @@ def _reader_notes(meta: dict, now: datetime) -> list[str]:
 def _doc_provenance(meta: dict) -> str:
     """The inline provenance line for an exported doc: a source, or a named attestation."""
     if meta.get("provenance_type") == "attestation" or (not meta.get("source") and meta.get("attested_by")):
-        who = meta.get("attested_by") or "unknown"
+        who = _person(meta.get("attested_by"), meta.get("attested_by_name")) or "unknown"
         on = meta.get("attested_on")
         return f"Attested by: {who}" + (f" ({on})" if on else "")
     return f"Source: {meta.get('source') or meta.get('id')}"
