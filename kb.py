@@ -155,6 +155,7 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 _FM_FIELD_ORDER = [
     "schema_version", "id", "title", "domain", "type", "status", "owner_gid", "owner_name",
     "provenance_type", "source", "attested_by", "attested_on", "confidence", "verified",
+    "verified_by",
     "supersedes", "related", "tags",
 ]
 
@@ -228,6 +229,16 @@ def validate_entry(meta: dict, body: str) -> list[str]:
             errors.append("provenance_type attestation requires attested_by and attested_on")
     elif prov:
         errors.append(f"invalid provenance_type: {prov} (must be reference or attestation)")
+
+    # `verified` records WHEN, `verified_by` records WHO. Only the pair is auditable: a bare date cannot
+    # distinguish a person who read the body from a process that stamped it, so the two records are
+    # byte-identical and the unearned one is invisible for ever. `verified_by` is OPTIONAL for now
+    # (see `verify-audit`), so this checks coherence only and refuses nothing that exists today.
+    # `_iso_date` is the check, not a membership test: `verified: null` parses to None and `str(None)`
+    # is "None", which passes any "is it empty or the literal unverified" test while being no date at
+    # all. Using the parser also makes the message true of a typo'd date rather than only of a blank.
+    if meta.get("verified_by") and _iso_date(meta.get("verified")) is None:
+        errors.append("verified_by is set but verified is not a date; name the date that was verified")
 
     # Voice gate: no em-dashes anywhere in the human-readable content.
     if "—" in body or "—" in str(meta.get("title", "")):
@@ -2479,6 +2490,72 @@ def cmd_pin_audit(args) -> int:
     return 0
 
 
+def cmd_verify_audit(args) -> int:
+    """Report nuggets asserting a `verified` date that names nobody. Report-only; never writes.
+
+    `verified` is defined as *last human verification*, but it stores only a date. A date written after a
+    person read the body and a date written by a process that read nothing are byte-identical, so the
+    unearned one is invisible for ever. The hygiene sweep cannot help: `rot` flags a date for being too
+    OLD, and nothing anywhere flags one for being unearned. That asymmetry is one-directional by
+    construction, and it is why an over-claim is the expensive error: an under-claimed date gets the
+    nugget flagged and re-read, while an over-claimed one is simply believed.
+
+    `verified_by` closes it by recording WHO. This command reports the gap rather than refusing it,
+    because every nugget predates the field; enforcement moves into `validate_entry` once the
+    unattributed count is worked down (see `schema/kb-entry.md`).
+    """
+    root = Path(args.repo).expanduser().resolve()
+    nuggets = _load_nuggets(root)
+    rows = []
+    for n in nuggets:
+        meta = n["meta"]
+        # `null`, `~` and an empty value all parse to Python None, and `str(None)` is the string "None",
+        # which is neither a date nor the literal "unverified". Normalise BEFORE testing. Without this,
+        # `verified_by: null` reads as attributed to someone called None, which is a false clear in the
+        # one direction this command exists to close, and `verified: null` reads as a claim that was
+        # never made. Both were live until an adversarial review found them.
+        raw = "" if meta.get("verified") is None else str(meta["verified"]).strip()
+        who = "" if meta.get("verified_by") is None else str(meta["verified_by"]).strip()
+        if raw in ("", "unverified"):
+            verdict, detail = "unverified", "claims no verification, so nothing to attribute"
+        elif _iso_date(raw) is None:
+            # Present but not a date, so it asserts something no reader can check. Reported on its own
+            # rather than folded into "unverified", which would quietly clear a typo'd claim.
+            verdict, detail = "unparseable", f"verified is {raw!r}, which is not an ISO-8601 date"
+        elif who:
+            verdict, detail = "attributed", f"verified {raw} by {who}"
+        else:
+            verdict, detail = "unattributed", f"claims verification on {raw} but names nobody"
+        rows.append({"id": meta.get("id"), "verdict": verdict, "verified": raw or None,
+                     "verified_by": who or None, "detail": detail})
+
+    counts = {v: sum(1 for r in rows if r["verdict"] == v)
+              for v in ("attributed", "unattributed", "unparseable", "unverified")}
+    # Same scope discipline as pin-audit: this takes one --repo and the KB spans several audience repos,
+    # so a clean run here says nothing about the others.
+    scope = {"repo": root.name, "path": str(root), "nuggets_scanned": len(nuggets),
+             "covers": "this clone only"}
+    if args.json:
+        print(json.dumps({"scope": scope, "counts": counts, "rows": rows}, indent=2))
+        return 0
+
+    print(f"verify-audit scope: {scope['repo']} at {scope['path']}")
+    print(f"  {scope['nuggets_scanned']} nuggets scanned. THIS CLONE ONLY; run it once per audience repo.")
+    for verdict, label in (("unattributed", "asserts a verification nobody is named for"),
+                           ("unparseable", "verified is set to something that is not a date")):
+        hits = [r for r in rows if r["verdict"] == verdict]
+        if not hits:
+            continue
+        print(f"\n{label}: {len(hits)}")
+        for r in hits:
+            print(f"  {r['id']}\n      {r['detail']}")
+    print(f"\nverify-audit: {counts['attributed']} attributed, {counts['unattributed']} unattributed, "
+          f"{counts['unparseable']} unparseable, {counts['unverified']} claim no verification.")
+    print("An unattributed date is not evidence of anything: it cannot distinguish a person who read the")
+    print("body from a process that stamped it. Set `verified_by` when you bump `verified`.")
+    return 0
+
+
 def cmd_prescan(args) -> int:
     """Scan the manifest's [seed_sources] into ranked pointer candidates plus a captured-vs-gap report.
 
@@ -2959,6 +3036,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--repo", default=".", help="KB repo root to audit (default: current dir)")
     sp.add_argument("--json", action="store_true", help="emit the full report as JSON")
     sp.set_defaults(func=cmd_pin_audit)
+
+    sp = sub.add_parser("verify-audit",
+                        help="report nuggets asserting a verified date that names no verifier")
+    sp.add_argument("--repo", default=".", help="KB repo root to audit (default: current dir)")
+    sp.add_argument("--json", action="store_true", help="emit the full report as JSON")
+    sp.set_defaults(func=cmd_verify_audit)
 
     sp = sub.add_parser("prescan",
                         help="scan the manifest's seed sources into ranked pointer candidates (secrets-safe)")
