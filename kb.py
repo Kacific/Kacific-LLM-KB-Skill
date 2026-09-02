@@ -27,6 +27,7 @@ import fnmatch
 import hashlib
 import html
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -2140,6 +2141,166 @@ def _scan_seed_source(key: str, spec: dict, root: Path, remote: str | None, sha:
     return {"counts": counts, "candidates": candidates}
 
 
+# --- pin audit: does a pointer's BODY still say what its pinned SOURCE says? -------------------------
+#
+# A pointer nugget pins `source:` to a blob at a fixed SHA. Moving that SHA forward without regenerating the
+# body leaves the KB publishing a superseded statement while pointing at a source that contradicts it. That
+# state is invisible to every other check here: the staleness sweep sees a current pin, the truncation guard
+# sees complete prose, and `sync` sees a body hash matching the registry it was published from. It is only
+# visible by reading the body against the source, which is what this does.
+
+# A status a document asserts about ITSELF. Compared only with its opposite number on the other side; never
+# used to rank "newness". Deliberately NOT date-based: a date in a body says when someone wrote a line, not
+# whether the line is still true, and ranking the two sides by date gets the answer confidently wrong. That
+# is not hypothetical, it is how a 2026-09-02 review misread a stored body that was BOTH later-dated and
+# stale, and nearly reported a correct repair as damage.
+_STATUS_CLOSED = frozenset("""
+done sent finalised finalized complete completed resolved closed shipped landed merged issued superseded
+moved retired archived decommissioned cancelled canceled approved signed executed live""".split())
+_STATUS_OPEN = frozenset("""
+draft drafting proposed pending open todo wip outstanding planned unissued unsent blocked waiting
+provisional tentative""".split())
+_STATUS_LINE = re.compile(r"\b(?:status|state)\b\s*:?\*{0,2}\s*(.{0,80})", re.I)
+
+
+_STATUS_NEGATORS = frozenset("not never no nor without yet awaiting pending unless".split())
+
+
+def _status_tokens(text: str) -> set:
+    """Status words a text asserts about itself, taken from its status/state lines only.
+
+    Scoped to a status line rather than the whole body on purpose: prose mentions "done" and "pending" in
+    passing all the time, and a whole-body scan turns every such mention into a false alarm.
+
+    Negated words are dropped, and that is a correctness requirement rather than tidiness. "not yet issued"
+    is a claim that the thing is OPEN; counting `issued` from it would put a closed token on the open side
+    and cancel a real finding, which is the expensive direction for this check. The phrase is not invented:
+    it is what the one nugget that shipped this defect actually said.
+    """
+    found: set = set()
+    for claim in _STATUS_LINE.findall(str(text or "")):
+        words = [w.lower() for w in re.findall(r"[a-zA-Z]+", claim)]
+        for i, low in enumerate(words):
+            if low not in _STATUS_CLOSED and low not in _STATUS_OPEN:
+                continue
+            if any(w in _STATUS_NEGATORS for w in words[max(0, i - 3):i]):
+                continue
+            found.add(low)
+    return found
+
+
+def _seed_key_of(meta: dict) -> str:
+    """The [seed_sources] key prescan used for this nugget, recovered from its tags.
+
+    Only the pointer-line fallback embeds the key ("Pointer to X in the <key> seed source"), but getting it
+    wrong makes every such abstract look changed when nothing has. prescan tags a nugget with its seed key
+    in snake_case (shadow_it) alongside `prescan` and the audience label.
+    """
+    for tag in meta.get("tags") or []:
+        if tag != "prescan" and "_" in tag:
+            return tag.replace("_", "-")
+    return str(meta.get("domain") or "seed")
+
+
+def audit_pin_row(meta: dict, body: str, source_text: str | None) -> dict:
+    """Classify one pointer nugget against the text of its own pinned source. Pure; no network, no clock.
+
+    Verdicts:
+      stale-status the body claims the work is still open while the source says it is closed. The severe
+                  one: the KB is publishing a falsehood, not merely an out-of-date phrasing. Checked for
+                  EVERY pointer, hand-written or generated, because it is the failure that misleads readers.
+      ok          nothing to report. For a generated body that means it still reproduces from this source;
+                  for a hand-written one it means only that no status contradiction was found.
+      diverged    a GENERATED body no longer reproduces from its source, with no status signal either way.
+                  Not a defect on its own: a reworded source does this too. It means "a human has to read
+                  this one", never "regenerate this one".
+      unfetchable the pinned blob could not be read, so nothing is claimed about it.
+
+    The regeneration comparison runs ONLY on bodies prescan generated (tag `prescan`). A hand-written body
+    never reproduces from a generator, so comparing it that way reports drift on every run forever, and a
+    report that is always noisy is one nobody reads. Hand-written bodies get the status check alone.
+
+    An `ok` verdict means nothing contradicted the source. It does NOT mean the body is true, and it cannot:
+    the source itself may be wrong.
+    """
+    if source_text is None:
+        return {"id": meta.get("id"), "verdict": "unfetchable", "detail": "pinned blob could not be read"}
+    stored = str(body or "").strip()
+    stored_status, source_status = _status_tokens(stored), _status_tokens(source_text)
+    closed_now = (source_status & _STATUS_CLOSED) - stored_status
+    open_still = (stored_status & _STATUS_OPEN) - source_status
+    if closed_now and open_still:
+        return {"id": meta.get("id"), "verdict": "stale-status",
+                "detail": f"body says {'/'.join(sorted(open_still))}; source says "
+                          f"{'/'.join(sorted(closed_now))}"}
+    if "prescan" not in (meta.get("tags") or []):
+        return {"id": meta.get("id"), "verdict": "ok", "detail": "hand-written body; status-checked only"}
+    # Repo-relative path, taken from the blob URL itself. Not from _norm_source, whose "github:owner/repo/path"
+    # form keeps the repo segment; prescan builds the abstract from the repo-relative path, so borrowing the
+    # normalised form would put an extra segment into every pointer line and report it as drift.
+    m = re.match(r"https://github\.com/[^/]+/[^/]+/blob/[^/]+/(.+)$", str(meta.get("source", "")))
+    relpath = urllib.parse.unquote(m.group(1)) if m else str(meta.get("source", ""))
+    is_md = relpath.lower().endswith(".md")
+    _title, raw = _extract_title_abstract(source_text, relpath.rsplit("/", 1)[-1], is_md)
+    regenerated = _candidate_abstract(raw, relpath, _seed_key_of(meta))
+    if stored == regenerated.strip():
+        return {"id": meta.get("id"), "verdict": "ok", "detail": ""}
+    return {"id": meta.get("id"), "verdict": "diverged", "detail": "body is not what this source yields; "
+                                                                  "needs a human read, not a regeneration"}
+
+
+def _fetch_pinned_source(source_url: str, token: str | None) -> str | None:
+    """Read a GitHub blob URL pinned at a fixed SHA. Replaced wholesale by the tests; the only network here."""
+    m = re.match(r"https://github\.com/([^/]+)/([^/]+)/blob/([0-9a-f]{7,40})/(.+)$", str(source_url or ""))
+    if not m:
+        return None
+    owner, repo, ref, path = m.groups()
+    url = (f"https://api.github.com/repos/{owner}/{repo}/contents/{urllib.parse.quote(path)}"
+           f"?ref={urllib.parse.quote(ref)}")
+    headers = {"Accept": "application/vnd.github.raw", "User-Agent": "kb.py-pin-audit"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as resp:
+            return resp.read().decode("utf-8", "replace")
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+        return None
+
+
+def cmd_pin_audit(args) -> int:
+    """Report pointer nuggets whose body no longer matches the source they pin. Report-only; never writes.
+
+    Run it after any re-pin. The `kacific-kb` contract already asks for the body to be diffed against the
+    file at the new SHA; skipping that step is what publishes a resolved item as open, so this makes the
+    step runnable instead of remembered.
+    """
+    root = Path(args.repo).expanduser().resolve()
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    rows = []
+    for n in _load_nuggets(root):
+        meta = n["meta"]
+        if meta.get("provenance_type") != "reference" or not str(meta.get("source", "")).startswith("http"):
+            continue
+        rows.append(audit_pin_row(meta, n["body"], _fetch_pinned_source(meta["source"], token)))
+    counts = {v: sum(1 for r in rows if r["verdict"] == v) for v in
+              ("ok", "stale-status", "diverged", "unfetchable")}
+    if args.json:
+        print(json.dumps({"counts": counts, "rows": rows}, indent=2))
+    else:
+        for verdict, label in (("stale-status", "SEVERE: body publishes an open status its source has closed"),
+                               ("diverged", "needs a human read (a hand-improved body looks like this too)"),
+                               ("unfetchable", "pinned blob unreadable; nothing claimed")):
+            hits = [r for r in rows if r["verdict"] == verdict]
+            if not hits:
+                continue
+            print(f"\n{label}: {len(hits)}")
+            for r in hits:
+                print(f"  {r['id']}" + (f"\n      {r['detail']}" if r["detail"] else ""))
+        print(f"\npin-audit: {len(rows)} pointer nuggets, {counts['ok']} matching their source.")
+        print("An 'ok' means the body matches the source it points at, never that the body is true.")
+    return 0
+
+
 def cmd_prescan(args) -> int:
     """Scan the manifest's [seed_sources] into ranked pointer candidates plus a captured-vs-gap report.
 
@@ -2614,6 +2775,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="close the tasks in Asana; default is a read-only dry-run that prints what it "
                          "would close")
     sp.set_defaults(func=cmd_coordination_audit)
+
+    sp = sub.add_parser("pin-audit",
+                        help="report pointer nuggets whose body no longer matches their pinned source")
+    sp.add_argument("--repo", default=".", help="KB repo root to audit (default: current dir)")
+    sp.add_argument("--json", action="store_true", help="emit the full report as JSON")
+    sp.set_defaults(func=cmd_pin_audit)
 
     sp = sub.add_parser("prescan",
                         help="scan the manifest's seed sources into ranked pointer candidates (secrets-safe)")
