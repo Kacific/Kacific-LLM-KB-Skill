@@ -364,6 +364,22 @@ def _load_nuggets(root: Path) -> list[dict]:
     """
     nuggets: list[dict] = []
     for md in sorted(root.rglob("*.md")):
+        # `.claude/worktrees/<task>` holds a SECOND checkout of this repo, so rglob finds every nugget
+        # twice and every count in every report silently doubles. The estate works worktree-per-session,
+        # so one is present most of the time; on 2026-09-02 a peer's worktree made pin-audit report 264
+        # rows for 132 nuggets. Excluded by PATH, not by gitignore, because rglob never consults git.
+        #
+        # RELATIVE to root, which is the whole trick. Testing md.parts against the ABSOLUTE path excludes
+        # everything the moment the repo itself sits under such a directory, and that is the normal case
+        # here: a linked worktree lives at <repo>/.claude/worktrees/<task>, so every file in it carries
+        # `.claude` in its absolute parts. The first version of this filter did exactly that and emptied
+        # the corpus, which showed up as seven unrelated checks reporting zero nuggets.
+        try:
+            rel_parts = md.relative_to(root).parts
+        except ValueError:  # not under root at all; nothing sensible to say about it
+            continue
+        if ".claude" in rel_parts or ".git" in rel_parts:
+            continue
         if md.name in {"README.md", "registry.md", "AGENTS.md", "CLAUDE.md"} or "sources" in md.parts:
             continue
         meta, body = parse_frontmatter(md.read_text(encoding="utf-8"))

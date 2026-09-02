@@ -1151,6 +1151,26 @@ def pin_audit_sees_a_directory_pin_going_stale():
 
 
 @check
+def load_nuggets_ignores_a_nested_worktree():
+    """A worktree under .claude holds a second checkout, so an unfiltered rglob counts every nugget twice.
+
+    The estate works worktree-per-session, so one is present most of the time, and the failure is silent:
+    every count in every report doubles and nothing errors. It was measured at 264 rows for 132 nuggets,
+    believed, retracted when the worktree happened to be absent at re-measure, then reinstated when it
+    came back. rglob does not consult gitignore, so the exclusion has to be by path.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        (root / "technical").mkdir()
+        _write(root / "technical" / "a.md", _nugget(id="a"))
+        wt = root / ".claude" / "worktrees" / "peer" / "technical"
+        wt.mkdir(parents=True)
+        _write(wt / "a.md", _nugget(id="a"))
+        got = kb._load_nuggets(root)
+    return len(got) == 1, f"loaded {len(got)} (the nested copy must not count)"
+
+
+@check
 def pin_audit_tells_an_enriched_body_from_a_drifted_one():
     """A body someone improved never regenerates, so "diverged" alone makes the report permanently noisy.
 
