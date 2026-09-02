@@ -33,10 +33,16 @@ VALID_REFERENCE = FIXTURE_KB / "technical" / "password-rotation-a.md"
 VALID_ATTESTATION = FIXTURE_KB / "shared" / "vpn-reset.md"
 
 
-def run(*args: str) -> subprocess.CompletedProcess:
+def run(*args: str, cwd: str | Path | None = None) -> subprocess.CompletedProcess:
+    """Run kb.py. Defaults to REPO_ROOT; pass `cwd` for a check that depends on what is NOT there.
+
+    kb.py resolves `config.toml` relative to the working directory, so any check asserting that a command
+    fails for want of config is really asserting that REPO_ROOT is unconfigured. That holds in a checkout
+    and is false in a deployment, which correctly has one. Such a check must run somewhere isolated.
+    """
     return subprocess.run(
         [sys.executable, str(KB_PY), *args],
-        capture_output=True, text=True, cwd=str(REPO_ROOT),
+        capture_output=True, text=True, cwd=str(cwd or REPO_ROOT),
     )
 
 
@@ -333,7 +339,15 @@ def index_stamps_last_used_from_log():
 @check
 def sync_requires_manifest():
     # With no config.toml in cwd, sync has no [repos].manifest to resolve and must say so, not guess.
-    p = run("sync")
+    #
+    # Run from an ISOLATED cwd. This check asserts the absence of a config, and it used to run from
+    # REPO_ROOT, which made it assert that the checkout is unconfigured. True of a checkout, false of a
+    # deployment: the NUC's production clone correctly carries config.toml at its root, so `sync` found
+    # its manifest, returned 0, and the negative assertion could not hold. The suite reported 86/87
+    # there for every commit, mine and every peer's, purely because production is configured. Found by
+    # deploying, not by running the suite locally, where it can never fail.
+    with tempfile.TemporaryDirectory() as d:
+        p = run("sync", cwd=d)
     ok = p.returncode != 0 and "manifest" in p.stderr.lower()
     return ok, f"rc={p.returncode} stderr={p.stderr.strip()!r}"
 
