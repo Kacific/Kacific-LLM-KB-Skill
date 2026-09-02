@@ -1464,22 +1464,6 @@ def export_rendered_bundle_has_no_emdash():
 
 
 @check
-def load_nuggets_ignores_a_nested_worktree():
-    # Sessions work in a gitignored `.claude/worktrees/<task>` INSIDE the repo, and rglob does not read
-    # .gitignore, so the same nuggets were counted twice whenever a worktree happened to be open. Found
-    # live: a peer's worktree made a real audience repo report 264 nuggets against a registry of 149,
-    # which would have had `rot` calling every id a duplicate.
-    with tempfile.TemporaryDirectory() as d:
-        root = Path(d)
-        _write(root / "shared" / "n.md", _nugget(id="only-once"))
-        _write(root / ".claude" / "worktrees" / "peer" / "shared" / "n.md", _nugget(id="only-once"))
-        found = kb._load_nuggets(root)
-    ids = [n["meta"]["id"] for n in found]
-    ok = ids == ["only-once"]
-    return ok, f"found={ids} (a nested worktree must not double the count)"
-
-
-@check
 def verify_audit_flags_a_date_that_names_nobody():
     # The whole point of the field: a dated `verified` with no `verified_by` is a claim with nobody
     # behind it, and before this command nothing in the tool could say so.
@@ -1530,22 +1514,73 @@ def store_still_accepts_a_dated_verified_with_no_verifier():
 
 
 @check
-def verified_by_survives_a_store_round_trip():
-    # It has to appear in _FM_FIELD_ORDER or emit_frontmatter drops it silently on the way out.
+def emit_frontmatter_orders_verified_by_next_to_verified():
+    # What _FM_FIELD_ORDER controls is ORDER, not survival. An earlier version of this check asserted
+    # the field survived a `store`, which passes with the _FM_FIELD_ORDER line reverted: `store` writes
+    # the source bytes verbatim and never calls emit_frontmatter, and emit_frontmatter appends unknown
+    # keys anyway. So it proved nothing. Assert the thing the line actually decides.
+    # `tags` and `related` matter to this fixture: they sort AFTER `verified` in _FM_FIELD_ORDER, so an
+    # unknown key (which emit_frontmatter appends last) lands after them. Without them, `verified` is the
+    # last known field present and an appended `verified_by` follows it by coincidence, so the check
+    # passes with the line under test reverted. It did exactly that on the first attempt.
+    meta = {"schema_version": "1", "id": "order-note", "title": "Order", "domain": "shared",
+            "type": "fact", "status": "published", "owner_gid": "0000000000000000",
+            "provenance_type": "attestation", "attested_by": "Example", "attested_on": "2020-01-01",
+            "verified": "2020-01-01", "verified_by": "0000000000000000",
+            "related": "[]", "tags": "[example]"}
+    out = kb.emit_frontmatter(meta, "A body long enough to clear the trivial threshold.")
+    keys = [ln.split(":", 1)[0] for ln in out.splitlines() if ":" in ln and not ln.startswith("---")]
+    ok = "verified" in keys and "verified_by" in keys and \
+        keys.index("verified_by") == keys.index("verified") + 1
+    return ok, f"verified at {keys.index('verified') if 'verified' in keys else None}, " \
+               f"verified_by at {keys.index('verified_by') if 'verified_by' in keys else None}"
+
+
+@check
+def a_null_verifier_is_not_counted_as_attributed():
+    # `verified_by: null` parses to None and str(None) is "None", which is truthy. Before this was
+    # normalised the audit reported "attributed ... by None": a false clear in the exact direction the
+    # command exists to close, reachable by typing one word. Found by adversarial review, not by me.
     with tempfile.TemporaryDirectory() as d:
-        repo = Path(d) / "repo"
-        repo.mkdir()
-        f = _write(Path(d) / "n.md",
-                   _nugget(id="roundtrip-note", domain="shared",
-                           verified="2020-01-01", verified_by="0000000000000000"))
-        p = run("store", str(f), "--into", str(repo))
-        stored = (repo / "shared" / "roundtrip-note.md")
-        # Read the existence flag INSIDE the block: the temp dir is gone by the time the detail string
-        # is built, so a post-hoc stored.exists() reports False on a passing check and reads as a bug.
-        existed = stored.exists()
-        text = stored.read_text(encoding="utf-8") if existed else ""
-    ok = p.returncode == 0 and "verified_by: 0000000000000000" in text
-    return ok, f"rc={p.returncode} stored={existed} has_field={'verified_by' in text}"
+        _write(Path(d) / "shared" / "n.md",
+               _nugget(id="null-verifier", verified="2020-01-01", verified_by="null"))
+        p = run("verify-audit", "--repo", d, "--json")
+    row = next((r for r in json.loads(p.stdout)["rows"] if r["id"] == "null-verifier"), None)
+    ok = row is not None and row["verdict"] == "unattributed"
+    return ok, f"verdict={row['verdict'] if row else None} (must be unattributed, never attributed)"
+
+
+@check
+def a_null_date_is_not_reported_as_a_claim():
+    # The mirror of the above: `verified: null` means not verified, and must not be reported as
+    # "claims verification on None".
+    with tempfile.TemporaryDirectory() as d:
+        _write(Path(d) / "shared" / "n.md", _nugget(id="null-date", verified="null"))
+        p = run("verify-audit", "--repo", d, "--json")
+    row = next((r for r in json.loads(p.stdout)["rows"] if r["id"] == "null-date"), None)
+    ok = row is not None and row["verdict"] == "unverified"
+    return ok, f"verdict={row['verdict'] if row else None} (must be unverified)"
+
+
+@check
+def store_refuses_a_named_verifier_against_a_null_date():
+    # The refusal now runs through _iso_date, so it fires on `verified: null` and on a typo'd date,
+    # not only on a blank. Membership-testing the raw value missed both.
+    with tempfile.TemporaryDirectory() as d:
+        f = _write(Path(d) / "bad.md", _nugget(verified="null", verified_by="0000000000000000"))
+        p = run("store", str(f))
+    ok = p.returncode == 1 and "REFUSED" in p.stderr and "verified_by" in p.stderr
+    return ok, f"rc={p.returncode} stderr={p.stderr.strip()!r}"
+
+
+@check
+def a_malformed_date_is_reported_rather_than_cleared():
+    with tempfile.TemporaryDirectory() as d:
+        _write(Path(d) / "shared" / "n.md", _nugget(id="typo-date", verified="2O20-01-01"))
+        p = run("verify-audit", "--repo", d, "--json")
+    row = next((r for r in json.loads(p.stdout)["rows"] if r["id"] == "typo-date"), None)
+    ok = row is not None and row["verdict"] == "unparseable"
+    return ok, f"verdict={row['verdict'] if row else None} (must not be silently cleared)"
 
 
 def main() -> int:

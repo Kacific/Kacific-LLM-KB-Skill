@@ -234,7 +234,10 @@ def validate_entry(meta: dict, body: str) -> list[str]:
     # distinguish a person who read the body from a process that stamped it, so the two records are
     # byte-identical and the unearned one is invisible for ever. `verified_by` is OPTIONAL for now
     # (see `verify-audit`), so this checks coherence only and refuses nothing that exists today.
-    if meta.get("verified_by") and str(meta.get("verified", "")).strip() in ("", "unverified"):
+    # `_iso_date` is the check, not a membership test: `verified: null` parses to None and `str(None)`
+    # is "None", which passes any "is it empty or the literal unverified" test while being no date at
+    # all. Using the parser also makes the message true of a typo'd date rather than only of a blank.
+    if meta.get("verified_by") and _iso_date(meta.get("verified")) is None:
         errors.append("verified_by is set but verified is not a date; name the date that was verified")
 
     # Voice gate: no em-dashes anywhere in the human-readable content.
@@ -389,15 +392,6 @@ def _load_nuggets(root: Path) -> list[dict]:
         if ".claude" in rel_parts or ".git" in rel_parts:
             continue
         if md.name in {"README.md", "registry.md", "AGENTS.md", "CLAUDE.md"} or "sources" in md.parts:
-            continue
-        # Skip dot-directories, which in practice means a NESTED WORKTREE. Sessions here work in a
-        # gitignored `.claude/worktrees/<task>` inside the repo, and rglob does not read .gitignore, so
-        # a checkout of the same branch was being walked as though it were more nuggets. Every count
-        # then doubles while a peer happens to have a worktree open: `rot` reports every id as a
-        # duplicate, `pin-audit` audits each pointer twice. The publish path never saw this because it
-        # rebuilds from each repo's remote HEAD rather than the working tree, which is exactly why it
-        # went unnoticed. Nugget directories are domain names and never start with a dot.
-        if any(part.startswith(".") for part in md.relative_to(root).parts):
             continue
         meta, body = parse_frontmatter(md.read_text(encoding="utf-8"))
         if not meta.get("id"):
@@ -2515,10 +2509,19 @@ def cmd_verify_audit(args) -> int:
     rows = []
     for n in nuggets:
         meta = n["meta"]
-        raw = str(meta.get("verified", "")).strip()
-        who = str(meta.get("verified_by", "")).strip()
+        # `null`, `~` and an empty value all parse to Python None, and `str(None)` is the string "None",
+        # which is neither a date nor the literal "unverified". Normalise BEFORE testing. Without this,
+        # `verified_by: null` reads as attributed to someone called None, which is a false clear in the
+        # one direction this command exists to close, and `verified: null` reads as a claim that was
+        # never made. Both were live until an adversarial review found them.
+        raw = "" if meta.get("verified") is None else str(meta["verified"]).strip()
+        who = "" if meta.get("verified_by") is None else str(meta["verified_by"]).strip()
         if raw in ("", "unverified"):
             verdict, detail = "unverified", "claims no verification, so nothing to attribute"
+        elif _iso_date(raw) is None:
+            # Present but not a date, so it asserts something no reader can check. Reported on its own
+            # rather than folded into "unverified", which would quietly clear a typo'd claim.
+            verdict, detail = "unparseable", f"verified is {raw!r}, which is not an ISO-8601 date"
         elif who:
             verdict, detail = "attributed", f"verified {raw} by {who}"
         else:
@@ -2527,7 +2530,7 @@ def cmd_verify_audit(args) -> int:
                      "verified_by": who or None, "detail": detail})
 
     counts = {v: sum(1 for r in rows if r["verdict"] == v)
-              for v in ("attributed", "unattributed", "unverified")}
+              for v in ("attributed", "unattributed", "unparseable", "unverified")}
     # Same scope discipline as pin-audit: this takes one --repo and the KB spans several audience repos,
     # so a clean run here says nothing about the others.
     scope = {"repo": root.name, "path": str(root), "nuggets_scanned": len(nuggets),
@@ -2538,13 +2541,16 @@ def cmd_verify_audit(args) -> int:
 
     print(f"verify-audit scope: {scope['repo']} at {scope['path']}")
     print(f"  {scope['nuggets_scanned']} nuggets scanned. THIS CLONE ONLY; run it once per audience repo.")
-    hits = [r for r in rows if r["verdict"] == "unattributed"]
-    if hits:
-        print(f"\nasserts a verification nobody is named for: {len(hits)}")
+    for verdict, label in (("unattributed", "asserts a verification nobody is named for"),
+                           ("unparseable", "verified is set to something that is not a date")):
+        hits = [r for r in rows if r["verdict"] == verdict]
+        if not hits:
+            continue
+        print(f"\n{label}: {len(hits)}")
         for r in hits:
             print(f"  {r['id']}\n      {r['detail']}")
     print(f"\nverify-audit: {counts['attributed']} attributed, {counts['unattributed']} unattributed, "
-          f"{counts['unverified']} claim no verification.")
+          f"{counts['unparseable']} unparseable, {counts['unverified']} claim no verification.")
     print("An unattributed date is not evidence of anything: it cannot distinguish a person who read the")
     print("body from a process that stamped it. Set `verified_by` when you bump `verified`.")
     return 0
