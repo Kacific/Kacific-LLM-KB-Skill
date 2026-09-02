@@ -624,6 +624,172 @@ def _log_interaction(record: dict, log_path: str = "logs/interactions.jsonl") ->
         fh.write(json.dumps(record) + "\n")
 
 
+# --- write-path guard: worktree discipline ----------------------------------
+#
+# Two rules, checked at the moment a nugget is written rather than at commit time. Commit
+# time is too late and, worse, it is blind: the breaches that motivated this wrote files
+# and never moved HEAD, so nothing keyed on a commit could ever have seen them.
+#
+#   R1 REFUSES a write into a shared main checkout of a governed repo. Pure stdlib, right
+#      here, with no dependency on anything outside this file. That is deliberate: R1 is
+#      the half that fails closed, so nothing optional may be able to break it.
+#   R2 WARNS when another live session is working in the destination worktree. It needs
+#      the machine's session store, which no clone carries, so it is optional by
+#      construction and silent when absent.
+#
+# Scope is narrow on purpose. This is not a git hook, it cannot block a commit or a push,
+# and `store` has no automated callers (the one scripted caller writes to a temp dir that
+# is not a git repo at all). An estate-wide hook that failed closed took out 136 hooks
+# across 65 clones once already; the blast radius here is one interactive command.
+
+# Emitted byte-identical into every governed repo's AGENTS.md from the repo-standards
+# template, so its presence is a reliable machine signal that a repo opts into these rules.
+MANAGED_BLOCK_MARKER = "kacific:concurrency-coordination"
+GUARD_REFUSED_SHARED_CHECKOUT = 2
+GUARD_REFUSED_INDETERMINATE = 3
+_GUARD_GIT_TIMEOUT = 5
+
+
+def _guard_git(args: list, cwd: str):
+    """Run git for the guard. Returns stripped stdout, or None for any failure at all.
+
+    Every exception is swallowed rather than propagated, and the caller reads None as
+    could-not-determine. Note the exception is never stringified: a subprocess error
+    embeds its full argv, which is how paths and credentials reach a transcript.
+    """
+    try:
+        p = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True,
+                           timeout=_GUARD_GIT_TIMEOUT, stdin=subprocess.DEVNULL)
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    return p.stdout.strip() or None
+
+
+def _nearest_existing_dir(path) -> str:
+    """The closest existing ancestor of `path`. The destination directory is created by
+    the write itself, so the guard has to stand somewhere real to ask git anything."""
+    p = os.path.realpath(str(path))
+    while p and not os.path.isdir(p):
+        parent = os.path.dirname(p)
+        if parent == p:
+            return ""
+        p = parent
+    return p
+
+
+def _repo_is_governed(root: str) -> bool:
+    """True when the repo root carries the managed concurrency block. AGENTS.md is often a
+    symlink to CLAUDE.md, so both are read and either satisfies it."""
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        try:
+            if MANAGED_BLOCK_MARKER in Path(root, name).read_text(encoding="utf-8"):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def guard_write_destination(dest_dir) -> tuple:
+    """R1. Returns (exit_code, lines): 0 to allow, non-zero to refuse.
+
+    The decision ladder, and each rung's default matters:
+      not inside a git repo        -> ALLOW  (temp dirs, the acceptance test, any scratch)
+      repo carries no managed block-> ALLOW  (the repo did not opt in; not ours to police)
+      linked worktree              -> ALLOW  (this is the sanctioned place to write)
+      shared main checkout         -> REFUSE (the rule this whole guard exists for)
+      anything indeterminate       -> REFUSE (operator ruling: ambiguity fails closed)
+
+    "Shared main checkout" is decided by comparing the git dir with the common git dir. In
+    a main checkout they are the same directory; in a linked worktree the former is
+    .git/worktrees/<name> under the latter. This avoids having to identify WHICH clone is
+    the declared read-only mirror, which nothing on disk marks: an incidental all-org
+    mirror is by definition a main checkout, so it is covered without being named.
+    """
+    base = _nearest_existing_dir(dest_dir)
+    if not base:
+        return GUARD_REFUSED_INDETERMINATE, [
+            "REFUSED. Could not resolve any existing parent of the destination:",
+            "  %s" % dest_dir,
+            "The guard refuses rather than guesses when it cannot look."]
+
+    root = _guard_git(["rev-parse", "--show-toplevel"], cwd=base)
+    if not root:
+        return 0, []  # not a git repo: nothing to police
+    root = os.path.realpath(root)
+
+    if not _repo_is_governed(root):
+        return 0, []  # repo has not opted in
+
+    git_dir = _guard_git(["rev-parse", "--absolute-git-dir"], cwd=base)
+    common = _guard_git(["rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=base)
+    if not common:
+        # --path-format wants git 2.31+. Without it --git-common-dir answers relatively
+        # (plain ".git" in a main checkout), and a relative path must be resolved against
+        # the directory git was asked from, never against this process's cwd. Getting that
+        # wrong would refuse every governed store on an older git, which is a fail-closed
+        # default doing real damage.
+        rel = _guard_git(["rev-parse", "--git-common-dir"], cwd=base)
+        common = os.path.join(base, rel) if rel else None
+    if not git_dir or not common:
+        return GUARD_REFUSED_INDETERMINATE, [
+            "REFUSED. This repo is governed by the worktree rule, but the guard could not",
+            "determine whether this is a worktree or a shared main checkout.",
+            "  destination: %s" % dest_dir,
+            "  repo:        %s" % root,
+            "Ambiguity refuses here, by ruling. Re-run from a worktree, or fix the repo."]
+
+    if os.path.realpath(git_dir) != os.path.realpath(common):
+        return 0, []  # a linked worktree: the sanctioned destination
+
+    return GUARD_REFUSED_SHARED_CHECKOUT, [
+        "REFUSED. This write would land in a SHARED MAIN CHECKOUT, not a worktree.",
+        "  destination: %s" % dest_dir,
+        "  repo:        %s" % root,
+        "",
+        "  Why: this repo's AGENTS.md carries the managed concurrency block, which says",
+        "  never to edit in a shared main checkout. A peer's checkout can move a branch",
+        "  under you mid-write, and an incidental all-org mirror is read-only and drifts.",
+        "",
+        "  Fix, copy and run (rename the worktree and branch if you prefer):",
+        "    git -C %s fetch --prune origin main" % root,
+        "    git -C %s worktree add .claude/worktrees/kb-store -b kb/store-nugget origin/main"
+        % root,
+        "  then re-run this store with:",
+        "    --into %s" % os.path.join(root, ".claude", "worktrees", "kb-store"),
+    ]
+
+
+def guard_occupancy_warnings(dest_dir) -> list:
+    """R2. Advisory only: returns lines to print, never blocks, never raises.
+
+    The helper lives on the operator's machine, outside any clone, so its path arrives by
+    environment variable. That is not a style choice: routing it through config.toml would
+    make `store` config-dependent, and config parsing needs tomllib, which would impose a
+    Python 3.11 floor on a command that deliberately runs on any Python 3.
+
+    Unset variable means R2 is simply not configured, which is every cold clone and every
+    CI run, so it stays silent. Set but unusable is a misconfiguration on a machine that
+    meant to have it, so it says so.
+    """
+    lib = os.environ.get("KACIFIC_ESTATE_LIB")
+    if not lib:
+        return []
+    try:
+        if lib not in sys.path:
+            sys.path.insert(0, lib)
+        import worktree_guard  # noqa: E402  (optional, resolved at call time by design)
+        return worktree_guard.warning_lines(str(dest_dir))
+    except ImportError:
+        return ["NOTE: KACIFIC_ESTATE_LIB is set to %s but worktree_guard could not be" % lib,
+                "      imported, so the live-session occupancy check did not run.",
+                "      Proceeding. This is a could-not-look, not an all-clear."]
+    except Exception:
+        return ["NOTE: the live-session occupancy check failed and was skipped.",
+                "      Proceeding. This is a could-not-look, not an all-clear."]
+
+
 # --- subcommands ------------------------------------------------------------
 
 def cmd_store(args) -> int:
@@ -637,6 +803,15 @@ def cmd_store(args) -> int:
         return 1
     if args.into:
         dest_dir = Path(args.into) / (meta.get("domain") or "shared")
+        # The write-path guard sits here, before the mkdir, because creating the domain
+        # directory is itself a write into the checkout being policed.
+        code, refusal = guard_write_destination(dest_dir)
+        if code:
+            for line in refusal:
+                print(line, file=sys.stderr)
+            return code
+        for line in guard_occupancy_warnings(dest_dir):
+            print(line, file=sys.stderr)
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / f"{meta['id']}.md"
         dest.write_text(text, encoding="utf-8")
