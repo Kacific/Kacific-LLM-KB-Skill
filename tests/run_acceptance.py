@@ -1151,6 +1151,31 @@ def pin_audit_sees_a_directory_pin_going_stale():
 
 
 @check
+def pin_audit_tells_an_enriched_body_from_a_drifted_one():
+    """A body someone improved never regenerates, so "diverged" alone makes the report permanently noisy.
+
+    Eight rows sat in the report as diverged, and all eight were verified by hand as true of their sources:
+    hand-enriched summaries of a WHOLE document, where the generator only reads paragraph one. Left as
+    diverged they train a reader to skim the report, which is the failure the report exists to avoid.
+
+    The separator is whether the body's distinctive claims appear in the source at all. Conservative on
+    purpose: one absent term keeps the row flagged, and a body with no distinctive terms stays flagged
+    too, because nothing-to-check is not the same as checked.
+    """
+    meta = {"id": "n", "tags": ["prescan", "shadow_it"],
+            "source": "https://github.com/o/r/blob/" + "a" * 40 + "/doc.md"}
+    src = ("# Doc\n\nShort opening line.\n\n## Later\n\nIt also covers `widget_tool.py` and the "
+           "**second phase**, which the opening never mentions.\n")
+    enriched = kb.audit_pin_row(meta, "Covers `widget_tool.py` and the **second phase**.", src)
+    drifted = kb.audit_pin_row(meta, "Covers `absent_tool.py` and the **second phase**.", src)
+    no_terms = kb.audit_pin_row(meta, "Some prose with nothing checkable in it at all.", src)
+    return (enriched["verdict"] == "enriched"
+            and drifted["verdict"] == "diverged"      # one absent term is enough to keep it flagged
+            and no_terms["verdict"] == "diverged",    # nothing to check is not "checked"
+            f"enriched={enriched['verdict']} drifted={drifted['verdict']} no_terms={no_terms['verdict']}")
+
+
+@check
 def pin_audit_status_words_come_from_status_lines_not_loose_prose():
     """Scoped to status lines: prose says "done" and "pending" in passing and must not trip the severe flag."""
     meta = {"id": "seed-y", "tags": ["prescan"], "domain": "technical",
