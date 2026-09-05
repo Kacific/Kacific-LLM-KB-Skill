@@ -928,7 +928,10 @@ def cmd_store(args) -> int:
         dest = dest_dir / f"{meta['id']}.md"
         dest.write_text(text, encoding="utf-8")
         print(f"OK: stored nugget '{meta['id']}' at {dest} (passes schema + anti-hallucination gate).")
-        print("Next: run `kb.py index` on the repo to refresh the registry.")
+        print("Next: commit it in the worktree and land it on the repo's main, then republish from the "
+              "control home with `kb.py index --manifest --publish`.")
+        print("Not `kb.py index <repo>`: that reads only this repo's own nuggets, so its output would "
+              "drop the shared base entries every published slice carries.")
     else:
         print(f"OK: nugget '{meta['id']}' passes the schema and the anti-hallucination gate.")
         print("Validate-only (no --into given). Pass --into <worktree> to write it into the KB: "
