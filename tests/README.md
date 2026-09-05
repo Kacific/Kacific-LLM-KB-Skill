@@ -14,7 +14,12 @@ listed. Any Python 3 works: the core commands import `tomllib` lazily, so the ha
 
 - **store**: valid reference and valid attestation nuggets pass the gate; a reference with no source, an
   em-dash in the body, and a missing required field are each refused (exit 1, `REFUSED`).
-- **store --into**: writes the nugget to `<repo>/<domain>/<id>.md`.
+- **store --into**: writes the nugget to `<destination>/<domain>/<id>.md`, the destination being a linked
+  worktree of the repo.
+- **store --into write-path guard**: a write into a governed repo's shared main checkout is refused (exit 4)
+  and no file is written; the same repo's linked worktree is allowed; a repo that never opted in is allowed;
+  a nested repo inside a governed checkout is refused; an inherited `GIT_DIR` does not open the guard; and a
+  question the guard cannot answer is a could-not-look (exit 5), never an allow.
 - **index**: emits a registry whose entries each carry a content hash and a path, one per fixture nugget.
 - **answer**: a matching query returns the nugget body with a `[Source: ...]` citation; an unmatched query
   returns exactly the miss phrase (borrowed from `kb.MISS_RESPONSE`, so the test cannot drift from the code).

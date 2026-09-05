@@ -35,7 +35,7 @@ kb.py coordination-audit  close opt-in coordination tasks whose tracked KB findi
                        (--commit closes them; default is a read-only dry-run)
 kb.py sync             drift-detect the managed repos against the recorded aggregate
 kb.py prescan          scan the manifest's seed sources into ranked pointer candidates (--commit stages
-                       them for review; keepers land via the normal store gate)
+                       them for review; keepers land via the normal store gate, into a linked worktree)
 kb.py export           (Phase 1b)
 ```
 
