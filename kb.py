@@ -2303,8 +2303,17 @@ def _slugify(text: str, max_len: int = 60) -> str:
 
 
 def _plain_voice(text: str) -> str:
-    """Collapse whitespace and swap em/en dashes so generated prose passes the voice gate."""
-    return " ".join(str(text).replace(chr(0x2014), ", ").replace(chr(0x2013), "-").split())
+    """Collapse whitespace and swap em/en dashes so generated prose passes the voice gate.
+
+    An em dash becomes a comma, consuming any whitespace on either side, so a spaced em dash
+    ("A <emdash> B") yields "A, B" rather than the bare " , " a plain character swap leaves
+    behind. That artefact shipped in six seed titles: replacing only the dash left the space
+    in front of it, which survived the whitespace collapse as its own token. An em dash
+    orphaned at either end is dropped rather than left as a leading or trailing comma.
+    """
+    text = re.sub(r"\s*\u2014\s*", ", ", str(text))   # em dash -> ", ", no orphaned space
+    text = text.replace(chr(0x2013), "-")             # en dash -> hyphen
+    return " ".join(text.split()).strip().strip(",").strip()
 
 
 def _seed_source_url(remote: str | None, sha: str | None, relpath: str) -> str:
