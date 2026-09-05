@@ -118,6 +118,25 @@ def store_refuse_emdash():
 
 
 @check
+def plain_voice_spaced_emdash_no_orphan_comma():
+    # Build the dashes from code points so this source file stays em-dash-clean itself.
+    em, en = chr(0x2014), chr(0x2013)
+    spaced = kb._plain_voice("A " + em + " B")     # the six seed titles were this shape
+    unspaced = kb._plain_voice("A" + em + "B")
+    trailing = kb._plain_voice("Title " + em)      # orphaned em dash: no trailing comma
+    en_range = kb._plain_voice("2020" + en + "2024")
+    ok = (
+        spaced == "A, B"                # not the shipped " , " artefact
+        and " , " not in spaced         # pair the check with the wrong behaviour it rejects
+        and unspaced == "A, B"
+        and em not in spaced            # voice gate: no em dash survives
+        and trailing == "Title"
+        and en_range == "2020-2024"     # en dash -> hyphen, unchanged
+    )
+    return ok, f"spaced={spaced!r} unspaced={unspaced!r} trailing={trailing!r} en={en_range!r}"
+
+
+@check
 def store_refuse_missing_required():
     with tempfile.TemporaryDirectory() as d:
         f = _write(Path(d) / "noowner.md", _nugget(owner_gid=None))
