@@ -155,6 +155,57 @@ def store_into_writes_by_domain():
 
 
 @check
+def store_hints_point_at_a_worktree():
+    """The two destination hints a user actually meets, pinned to say worktree.
+
+    These are wording, so nothing else in this suite touches them, and that is exactly how
+    they came to contradict the write-path guard for four days: the guard shipped in PR #32,
+    the hints went on naming a bare repo root, and no check was looking. Both directions are
+    asserted, because "names a worktree" alone would still pass if the old sentence sat
+    beside the new one.
+
+    `--help` WRAPS its text to the terminal width, so the raw string spans lines and a
+    literal match false-fails. Collapse whitespace first.
+    """
+    validate = run("store", str(VALID_REFERENCE))
+    helptext = run("store", "--help")
+    hint = " ".join(validate.stdout.split())
+    flat = " ".join(helptext.stdout.split())
+    names_worktree = "linked worktree of the KB repo" in flat
+    names_repo_root = "KB repo root to write" in flat
+    ok = (
+        validate.returncode == 0
+        and "linked worktree" in hint
+        and "--into <repo>" not in hint
+        and helptext.returncode == 0
+        and names_worktree
+        and not names_repo_root
+    )
+    return ok, (f"validate_rc={validate.returncode} hint={hint[-70:]!r} "
+                f"help_names_worktree={names_worktree} help_names_repo_root={names_repo_root}")
+
+
+@check
+def no_store_hint_names_a_bare_repo_as_the_destination():
+    """Source-level, and it covers what the runtime check structurally cannot.
+
+    The third hint is prescan's closing line, which needs config to reach, so this harness
+    can never execute it. Scanning the source also catches the phrasing being reintroduced
+    in a string nobody has written yet, which a runtime check pinned to two known call sites
+    would miss.
+
+    The control is what makes the zero mean anything: a zero from a scan that could not have
+    matched is a fact about the scan rather than about the file.
+    """
+    src = KB_PY.read_text(encoding="utf-8")
+    forbidden = src.count("--into <repo>")
+    control = src.count("--into <worktree>")
+    ok = forbidden == 0 and control >= 2
+    return ok, (f"'--into <repo>'={forbidden} (want 0), "
+                f"control '--into <worktree>'={control} (want >=2)")
+
+
+@check
 def index_emits_registry():
     p = run("index", str(FIXTURE_KB))
     if p.returncode != 0:
