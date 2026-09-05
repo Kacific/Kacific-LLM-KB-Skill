@@ -24,6 +24,7 @@ sources of truth, not a second copy of them.
 
 ```
 kb.py store <file>     validate a nugget against the schema and the anti-hallucination gate, then store it
+                       (--into a linked worktree; a governed repo's shared main checkout is refused)
 kb.py index <repo>     rebuild the registry from a repo
 kb.py answer <query>   answer from stored nuggets only, with grounding and citation
 kb.py rot              hygiene sweep for redundant, outdated, or trivial nuggets

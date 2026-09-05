@@ -5,7 +5,8 @@ One stdlib-first tool. Generic and parameterised: it carries no site-specific id
 specifics (repo paths, the tracking workspace, the PAT location) come from config.toml, never from this file.
 
 Subcommands:
-  store     validate a nugget against the schema and the anti-hallucination gate, then write it (or refuse)
+  store     validate a nugget against the schema and the anti-hallucination gate, then write it into the
+            linked worktree given by --into (a governed repo's shared main checkout is refused)
   index     walk the KB data repos and rebuild the aggregate registry, then derive per-audience slices
   answer    answer a query using only stored nuggets, with grounding, citation, and confidence
   rot       hygiene sweep: flag Redundant / Outdated (verified > 30 days) / Trivial; emit a report
@@ -930,7 +931,8 @@ def cmd_store(args) -> int:
         print("Next: run `kb.py index` on the repo to refresh the registry.")
     else:
         print(f"OK: nugget '{meta['id']}' passes the schema and the anti-hallucination gate.")
-        print("Validate-only (no --into given). Pass --into <repo> to write it into the KB.")
+        print("Validate-only (no --into given). Pass --into <worktree> to write it into the KB: "
+              "a linked worktree of the repo, never its shared main checkout.")
     return 0
 
 
@@ -3025,7 +3027,8 @@ def cmd_prescan(args) -> int:
     print(f"\nOK: staged {written} candidate(s) under {out_root}"
           + (f" ({invalid} failed validation, not staged)" if invalid else "") + ".")
     print(f"OK: report written to {report_path}")
-    print("Next: review the staged candidates, then land keepers via `kb.py store <file> --into <repo>`.")
+    print("Next: review the staged candidates, then land keepers via "
+          "`kb.py store <file> --into <worktree>`.")
     return 0
 
 
@@ -3288,7 +3291,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("store", help="validate and store a nugget")
     sp.add_argument("file")
-    sp.add_argument("--into", help="KB repo root to write the nugget into (by domain); omit to validate only")
+    sp.add_argument("--into", help="linked worktree of the KB repo to write the nugget into (by domain); "
+                                   "a governed repo's shared main checkout is refused; omit to validate only")
     sp.set_defaults(func=cmd_store)
 
     sp = sub.add_parser("index", help="rebuild the registry from a repo, or --manifest for the aggregate")
