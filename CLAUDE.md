@@ -158,12 +158,17 @@ config supplies the specifics.
 Conventional-commit subjects (`kb:`, `docs:`), one small logical change per PR, branch off `origin/main`,
 `pull --ff-only` before work.
 
-**There is no pre-commit hook in this repo, and that is stated positively so nobody goes looking for one.**
-The three checks you might expect from one are real, and not one of them runs at commit time. Two gate a
-NUGGET at `kb.py store`: `validate_entry` refuses a nugget that breaks the schema, and the same function is
-the voice gate that refuses an em dash in a body or title. The third, `_is_secret_name`, is narrower still,
-being `prescan`'s filter over its own seed sources, so it decides what the tool will READ and says nothing
-about what you may commit.
+**There is no pre-commit CONFIG, and nothing gates a commit on its content.** No `.pre-commit-config.yaml`
+has ever been tracked here, so do not go looking for one. A working clone may nonetheless carry local hooks
+in `.git/hooks/`, and some do: git never tracks that directory, so whatever is there arrived locally, does
+not travel with a clone, and is no part of this repo's contract. Read what your own clone has as a fact
+about your machine rather than about the repo, and do not infer from its presence that anything is checked.
+
+The three checks you might expect from a pre-commit hook are real, and not one of them runs at commit time.
+Two gate a NUGGET at `kb.py store`: `validate_entry` refuses a nugget that breaks the schema, and the same
+function is the voice gate that refuses an em dash in a body or title. The third, `_is_secret_name`, is
+narrower still, being `prescan`'s filter over its own seed sources, so it decides what the tool will READ
+and says nothing about what you may commit.
 
 What does gate a change is CI, which runs both acceptance harnesses on every push and pull request. Run
 them locally first: `python3 tests/run_acceptance.py` and `python3 tests/run_git_acceptance.py`. The second
