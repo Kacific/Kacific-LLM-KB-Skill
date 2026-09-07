@@ -26,9 +26,15 @@ shuffle a branch ref mid-commit.
   keyed on that path. This is not hypothetical, it cost a live incident. Under the repo it inherits all
   of them, and being gitignored keeps it out of the index. Full reasoning in the `using-git-worktrees`
   and `multi-agent-repo-coordination` vault skills.
-  **This repo's tracked `.gitignore` must carry `.claude/worktrees/`.** A local `.git/info/exclude` entry
-  is not enough: it never travels, so on a fresh clone the worktree shows as untracked and a nested
-  working copy can be committed by accident. Add the line if it is missing.
+  **This repo's tracked `.gitignore` must COVER `.claude/worktrees/`, which is not the same as carrying
+  that literal line.** A local `.git/info/exclude` entry, or a line in your global ignore file, is not
+  enough: neither travels, so on a fresh clone the worktree shows as untracked and a nested working copy
+  can be committed by accident. The global-ignore case is the worse of the two, because it fails toward
+  compliant. **Coverage is the test, and the way to ask is
+  `git -c core.excludesFile=/dev/null check-ignore -q .claude/worktrees/`**, where the pin is what makes
+  the answer a property of the repo rather than of the machine you happen to be on. A repo that ignores
+  `.claude/` wholesale, or whose `.gitignore` is a whitelist, already covers the path and needs nothing
+  added. Add the rule only where that probe says the path is not covered.
 - **Pull before dev.** `fetch --prune` then `pull --ff-only` (or branch straight off `origin/main`)
   before the first edit. Fast-forward only, never force. If `--ff-only` refuses (diverged) or a dirty
   tree would conflict, stop and surface it.
@@ -62,6 +68,15 @@ default, not optional, and hold even where a task prompt does not restate them.
   `reread-memory-before-planning`): re-read memory and this `AGENTS.md` from disk, enumerate the tooling
   that fires, and surface scope decisions before acting. Plan mode is the default cadence; action is the
   exception that needs alignment first.
+- **Land changes by PR, and merge your own.** Branch off the default branch, push, open the PR,
+  squash-merge it yourself, delete the branch. **No review is required and none should be waited for**,
+  unless this repo's own `AGENTS.md` says otherwise below, which overrides this block. Stated because it
+  was nowhere written down, which is not the same as unsettled: measured across the org on 2026-09-07,
+  **236 of 249** recent merged PRs were merged by their own author with zero reviews. The gap cut both
+  ways, since a session can read a PR requirement and infer that a reviewer is coming, which parks the
+  work indefinitely, or conclude the PR is skippable ceremony when it is the record of why a change was
+  made. Only the GitHub PR API can establish any of this: every squash-merge records GitHub's bot as the
+  committer, so `git log` can never distinguish a self-merge from a reviewed one.
 <!-- END kacific:agent-practices -->
 
 ## First pull (bootstrap)
