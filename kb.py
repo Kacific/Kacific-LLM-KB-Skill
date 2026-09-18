@@ -9,7 +9,7 @@ Subcommands:
             linked worktree given by --into (a governed repo's shared main checkout is refused)
   index     walk the KB data repos and rebuild the aggregate registry, then derive per-audience slices
   answer    answer a query using only stored nuggets, with grounding, citation, and confidence
-  rot       hygiene sweep: flag Redundant / Outdated (verified > 30 days) / Trivial; emit a report
+  rot       hygiene sweep: flag Redundant / Outdated (verified > 90 days) / Trivial; emit a report
   sync      git-fetch each managed repo, diff SHA and per-nugget body hash, report drift (1b)
   prescan   one-time seed: scan the manifest's seed-source repos into ranked pointer candidates plus a
             captured-vs-gap report; --commit stages them for human review (secrets-safe by name)
@@ -47,7 +47,7 @@ SCHEMA_VERSION = 1
 VALID_DOMAINS = {"technical", "commercial", "admin", "finance", "hr", "shared", "company"}
 VALID_TYPES = {"how-to", "troubleshooting", "faq", "known-issue", "reference", "fact", "glossary"}
 VALID_STATUS = {"draft", "published", "needs-update", "archived", "retired"}
-ROT_OUTDATED_DAYS = 30
+ROT_OUTDATED_DAYS = 90
 READER_STALE_DAYS = 90
 # A nugget cited by a real query within USAGE_WINDOW_DAYS is "in active use", so its ROT-OUTDATED flag is
 # held back: chasing a re-verification nobody is waiting on is what turned a batch of seeded nuggets into 108

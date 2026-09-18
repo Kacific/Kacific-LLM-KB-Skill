@@ -324,23 +324,29 @@ def last_used_map_takes_latest_hit_only():
 def rot_last_used_extends_and_ceiling():
     # The Outdated rule: a nugget verified past the window is left alone only while it is in active use AND
     # under the hard ceiling. Never-verified and past-ceiling are flagged regardless of use.
+    # Ages are derived from the real constants, not hardcoded, so a future change to ROT_OUTDATED_DAYS or
+    # ROT_HARD_CEILING_DAYS cannot silently move a fixture out of the band it is meant to exercise.
     now = _NOW
+    past_window = kb.ROT_OUTDATED_DAYS + 30       # outdated, still well under the hard ceiling
+    under_window = kb.ROT_OUTDATED_DAYS - 5       # not yet outdated at all
+    over_ceiling = kb.ROT_HARD_CEILING_DAYS + 20  # outdated AND past the ceiling
+    assert past_window < kb.ROT_HARD_CEILING_DAYS, "fixture age must sit inside the hold-back band"
 
     def nug(nid, days_verified):
         v = "unverified" if days_verified is None else (now - timedelta(days=days_verified)).strftime("%Y-%m-%d")
         return _nugget_dict(id=nid, verified=v)
 
     nuggets = [
-        nug("used-fresh", 60),          # verified 60d, used 5d ago -> NOT flagged (in use, under ceiling)
-        nug("used-stale-usage", 60),    # verified 60d, last used 200d ago -> flagged (not in use)
-        nug("unused", 60),              # verified 60d, never used -> flagged
-        nug("used-over-ceiling", 200),  # verified 200d (> ceiling), used 5d ago -> flagged (over ceiling)
-        nug("never-verified", None),    # never verified, used 5d ago -> flagged (use never excuses)
-        nug("still-fresh", 10),         # verified 10d (< window), unused -> NOT flagged (still fresh)
+        nug("used-fresh", past_window),          # in use, under ceiling -> NOT flagged
+        nug("used-stale-usage", past_window),    # last used outside the usage window -> flagged (not in use)
+        nug("unused", past_window),              # never used -> flagged
+        nug("used-over-ceiling", over_ceiling),  # over ceiling, used recently -> flagged (over ceiling)
+        nug("never-verified", None),             # never verified, used recently -> flagged (use never excuses)
+        nug("still-fresh", under_window),        # under the window, unused -> NOT flagged (still fresh)
     ]
     last_used = {
         "used-fresh": now - timedelta(days=5),
-        "used-stale-usage": now - timedelta(days=200),
+        "used-stale-usage": now - timedelta(days=kb.USAGE_WINDOW_DAYS + 20),
         "used-over-ceiling": now - timedelta(days=5),
         "never-verified": now - timedelta(days=5),
     }
@@ -355,7 +361,7 @@ def rot_last_used_extends_and_ceiling():
 def rot_empty_last_used_matches_legacy():
     # Regression guard: no map, or an empty map, reproduces the pre-usage behaviour exactly.
     now = _NOW
-    n = _nugget_dict(id="a", verified=(now - timedelta(days=60)).strftime("%Y-%m-%d"))
+    n = _nugget_dict(id="a", verified=(now - timedelta(days=kb.ROT_OUTDATED_DAYS + 30)).strftime("%Y-%m-%d"))
 
     def is_out(flags):
         return any(any(r.startswith("Outdated") for r in f["reasons"]) for f in flags)
@@ -369,7 +375,7 @@ def feedback_usage_suppresses_outdated_under_ceiling():
     # End-to-end through the feedback sweep: a stale-but-recently-cited nugget is held back; drop the usage
     # record and the same nugget is flagged KB-ROT-OUTDATED.
     now = datetime.now(timezone.utc)
-    vdate = (now - timedelta(days=60)).strftime("%Y-%m-%d")
+    vdate = (now - timedelta(days=kb.ROT_OUTDATED_DAYS + 30)).strftime("%Y-%m-%d")
     with tempfile.TemporaryDirectory() as d:
         repo = Path(d) / "kb"
         _write(repo / "shared" / "used-note.md", _nugget(id="used-note", title="Used note", verified=vdate))
