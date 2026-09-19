@@ -1692,6 +1692,44 @@ def _resolve_tracking_pat(config: dict) -> str:
     )
 
 
+def _resolve_github_token(config: dict) -> str:
+    """Resolve a GitHub token VALUE from its configured LOCATION, same three-way precedence and same
+    secrets-handling as `_resolve_tracking_pat`:
+      1. [github].token                inline value (dev; only ever in the private gitignored config)
+      2. [github].secret_file          a root-owned file path (the NUC prod location; read + stripped)
+      3. [github].macos_keychain_entry a Keychain entry name, read via `security ... -w`
+    Unlike the tracking PAT, this token is optional to every caller (pin-audit degrades to unauthenticated
+    GitHub API rate limits rather than failing outright), so returns "" rather than raising when nothing is
+    configured; callers that also accept GH_TOKEN/GITHUB_TOKEN env vars should fall back to those themselves."""
+    gh_cfg = config.get("github", {}) or {}
+
+    token = str(gh_cfg.get("token") or "").strip()
+    if token:
+        return token
+
+    secret_file = str(gh_cfg.get("secret_file") or "").strip()
+    if secret_file:
+        p = Path(secret_file).expanduser()
+        if p.exists():
+            value = p.read_text(encoding="utf-8").strip()
+            if value:
+                return value
+
+    entry = str(gh_cfg.get("macos_keychain_entry") or "").strip()
+    if entry:
+        try:
+            proc = subprocess.run(
+                ["security", "find-generic-password", "-s", entry, "-w"],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise SystemExit(f"could not read the GitHub token from Keychain entry '{entry}'")
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+
+    return ""
+
+
 class _AsanaError(Exception):
     """An Asana REST call that failed after retries. A normal Exception (not SystemExit) so the reconcile can
     catch it per-task and carry on (a stale assignee, an unreachable annotation) instead of aborting the run."""
@@ -2832,6 +2870,9 @@ def cmd_pin_audit(args) -> int:
     Run it after any re-pin. The `kacific-kb` contract already asks for the body to be diffed against the
     file at the new SHA; skipping that step is what publishes a resolved item as open, so this makes the
     step runnable instead of remembered.
+
+    A GitHub token is optional (raises the API rate limit and reaches private repos) and is resolved from
+    --config's [github] section (see `_resolve_github_token`), falling back to GH_TOKEN/GITHUB_TOKEN.
     """
     root = Path(args.repo).expanduser().resolve()
     if not root.is_dir():
@@ -2840,7 +2881,8 @@ def cmd_pin_audit(args) -> int:
         # matters most for an audit, whose whole output is an absence of findings.
         print(f"pin-audit: no such repo directory: {root}", file=sys.stderr)
         return 2
-    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    token = (_resolve_github_token(load_config(args.config))
+              or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"))
     nuggets = _load_nuggets(root)
     rows = []
     for n in nuggets:
@@ -3468,6 +3510,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="report pointer nuggets whose body no longer matches their pinned source")
     sp.add_argument("--repo", default=".", help="KB repo root to audit (default: current dir)")
     sp.add_argument("--json", action="store_true", help="emit the full report as JSON")
+    sp.add_argument("--config", default="config.toml",
+                    help="path to config.toml (for [github] token resolution; GH_TOKEN/GITHUB_TOKEN env "
+                         "vars are used if config resolves nothing)")
     sp.set_defaults(func=cmd_pin_audit)
 
     sp = sub.add_parser("verify-audit",

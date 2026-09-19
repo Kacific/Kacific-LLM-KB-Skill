@@ -1102,6 +1102,24 @@ def resolve_tracking_pat_order_and_error():
 
 
 @check
+def resolve_github_token_order_and_empty_is_not_an_error():
+    # Same three-way precedence as the tracking PAT, but unresolved is a legitimate "run unauthenticated"
+    # state for pin-audit, so it returns "" instead of raising.
+    inline = kb._resolve_github_token({"github": {"token": "INLINE"}})
+    with tempfile.TemporaryDirectory() as d:
+        sf = Path(d) / "gh_token"
+        sf.write_text("FILETOKEN\n", encoding="utf-8")
+        fromfile = kb._resolve_github_token({"github": {"secret_file": str(sf)}})
+        both = kb._resolve_github_token({"github": {"token": "INLINE", "secret_file": str(sf)}})
+    empty_no_section = kb._resolve_github_token({})
+    empty_blank_section = kb._resolve_github_token({"github": {}})
+    ok = (inline == "INLINE" and fromfile == "FILETOKEN" and both == "INLINE"
+          and empty_no_section == "" and empty_blank_section == "")
+    return ok, (f"inline={inline!r} file={fromfile!r} both={both!r} "
+                f"empty_no_section={empty_no_section!r} empty_blank_section={empty_blank_section!r}")
+
+
+@check
 def asana_client_never_leaks_pat_in_errors():
     # A failing request must not carry the PAT into the error message (it rides in a header, never the URL).
     client = kb._AsanaClient("SENTINELTOKEN", base="http://127.0.0.1:9", max_retries=0)

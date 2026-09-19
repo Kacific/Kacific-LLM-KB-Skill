@@ -33,6 +33,18 @@ secret_file = "/root/.secrets/<file>"
 macos_keychain_entry = "<entry-name-or-empty>"
 expires_at = "<YYYY-MM-DD>"   # tracked; warn 7 days before expiry
 
+[github]
+# Optional. A GitHub token for `kb.py pin-audit` to fetch pinned source blobs/trees at higher rate limits
+# (and to reach private Kacific-org repos). Same resolution shape and precedence as [tracking.pat] above,
+# first non-empty wins. Unlike the tracking PAT this is NOT required: pin-audit still runs unauthenticated
+# if nothing resolves here, and also honours GH_TOKEN/GITHUB_TOKEN env vars as a fallback when this section
+# resolves nothing (e.g. an existing dev-Mac direnv-exported token). Scope: fine-grained PAT, Kacific org,
+# Contents: Read-only, short expiry.
+token = "<inline-pat-value-private-config-only-or-empty>"
+secret_file = "/root/.secrets/<file>"
+macos_keychain_entry = "<entry-name-or-empty>"
+expires_at = "<YYYY-MM-DD>"   # tracked; warn 7 days before expiry
+
 [repos]
 # The private control home holds the authoritative repos.toml manifest. This template only points at it.
 # Besides [managed] and [audiences], the manifest may carry [seed_sources.<key>] tables for `kb.py prescan`
