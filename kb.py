@@ -2462,6 +2462,11 @@ def _extract_title_abstract(text: str, fallback_name: str, markdown: bool) -> tu
     Index from content, never the filename: the stem is only the last-resort title. A Markdown source with
     its own frontmatter contributes its title field and is scanned by body only. Non-Markdown files fall
     back to the first comment or docstring line.
+
+    A leading blockquote paragraph immediately after the title is skipped once, so a callout/admonition
+    box (the Kacific skills vault's own mandatory `> **Skill marker**: ...` line right after every
+    SKILL.md title being the motivating case) does not become the abstract in place of real content. Only
+    the FIRST such paragraph is skipped; a blockquote appearing later is ordinary content and is kept.
     """
     title = ""
     para: list[str] = []
@@ -2471,6 +2476,7 @@ def _extract_title_abstract(text: str, fallback_name: str, markdown: bool) -> tu
             title = str(fm_meta.get("title") or "")
             text = fm_body
         in_fence = False
+        skipped_leading_blockquote = False
         for line in text.splitlines():
             s = line.strip()
             if s.startswith("```"):
@@ -2487,6 +2493,10 @@ def _extract_title_abstract(text: str, fallback_name: str, markdown: bool) -> tu
             if s:
                 para.append(s)
             elif para:
+                if not skipped_leading_blockquote and all(p.startswith(">") for p in para):
+                    skipped_leading_blockquote = True
+                    para = []
+                    continue
                 break
     else:
         for line in text.splitlines():

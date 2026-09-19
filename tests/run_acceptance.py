@@ -1213,6 +1213,42 @@ def prescan_abstract_never_cuts_mid_sentence():
 
 
 @check
+def prescan_abstract_skips_a_leading_skill_marker_blockquote():
+    """The abstract is real content, not the vault's own '> Skill marker' callout.
+
+    Regression case: every SKILL.md in the Kacific skills vault opens with a mandatory
+    `> **Skill marker**: ...` blockquote directly after the H1 title. Before this fix,
+    `_extract_title_abstract` took that blockquote as the first prose paragraph, so every one of the
+    vault's SKILL.md files (not just one) produced the callout line as its abstract instead of the real
+    first paragraph, systemically breaking `kb.py prescan` against the vault seed source.
+    """
+    doc = (
+        "# Kacific NUC ops\n\n"
+        "> **Skill marker**: when applying this skill, begin your reply with `[skill: kacific-nuc-ops]` "
+        "on its own line.\n\n"
+        "## Overview\n\n"
+        "The NUC is the shared execution substrate for Kacific's per-tool ops repos."
+    )
+    _title, abstract = kb._extract_title_abstract(doc, "SKILL.md", True)
+    real_content = abstract == "The NUC is the shared execution substrate for Kacific's per-tool ops repos."
+    # A later, non-leading blockquote is ordinary content and must be kept, not skipped.
+    doc_later_quote = (
+        "# Some doc\n\n"
+        "Real opening paragraph here.\n\n"
+        "> A quoted remark that belongs to the body.\n"
+    )
+    _title2, abstract2 = kb._extract_title_abstract(doc_later_quote, "doc.md", True)
+    later_quote_kept = abstract2 == "Real opening paragraph here."
+    # A doc whose ONLY paragraph is a blockquote (no second paragraph exists) must not go empty.
+    doc_only_quote = "# Only a quote\n\n> Nothing else follows this line.\n"
+    _title3, abstract3 = kb._extract_title_abstract(doc_only_quote, "doc.md", True)
+    only_quote_not_empty = abstract3 == "> Nothing else follows this line."
+    return (real_content and later_quote_kept and only_quote_not_empty,
+            f"real_content={real_content} later_quote_kept={later_quote_kept} "
+            f"only_quote_not_empty={only_quote_not_empty} abstract={abstract!r}")
+
+
+@check
 def prescan_abstract_completes_only_an_uncut_line():
     """A terminator may finish a paragraph that fitted whole; it is never bolted onto a cut one."""
     short = "Provenance manifest for the internal guides and induction materials"
