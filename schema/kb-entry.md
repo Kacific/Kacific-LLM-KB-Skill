@@ -95,6 +95,22 @@ signal to the hygiene sweep, which holds back the Outdated flag for a nugget use
 until a hard ceiling age. It is never a substitute for `verified`: usage is not human confirmation, so
 `verified` stays a human-only field and a nugget past the ceiling is flagged regardless of use.
 
+**The interaction log this depends on is fed by `kb.py answer` alone, and that is only one of the two read
+paths.** The `kacific-kb` skill names a second, uninstrumented path (pull-then-read a nugget file directly)
+as "the always-available fallback", and it logs nothing. `kb.py touch <id> [<id> ...]` closes that gap: any
+session on the uninstrumented path can record a genuine citation with the same log entry `answer` writes on
+a hit, so the usage signal is not structurally starved down to whichever fraction of reads happen to go
+through the manager.
+
+**Source stability is a second, independent softener, read from `pin-audit`, never fetched by `rot`
+itself.** `rot --pin-audit-file <report.json>` (and `feedback --pin-audit-file`) hold back the Outdated flag
+for a nugget whose most recent `pin-audit` verdict was `ok` or `enriched`, i.e. its pinned source has not
+materially drifted since the pin, on exactly the same terms as usage: up to the hard ceiling, never in place
+of `verified`. A `could-not-look` verdict (`unpinned-ref`, `unfetchable`, `directory-pointer`,
+`external-pointer`) never counts as stable, per the estate's own rule that an unchecked surface must not
+read as an all-clear. Both softeners are additive-only: omit either flag and `rot` behaves exactly as it did
+before either existed.
+
 ## `verified_by`: who did the verifying, and why a bare date could not say
 
 `verified` records WHEN. On its own it cannot record WHETHER. A date written after a person read the body

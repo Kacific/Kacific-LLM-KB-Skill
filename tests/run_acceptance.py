@@ -393,6 +393,136 @@ def feedback_usage_suppresses_outdated_under_ceiling():
 
 
 @check
+def touch_records_a_usable_hit():
+    # kb.py touch is the uninstrumented read path's equivalent of the logging `answer` already does on a
+    # hit: the record it writes must feed _last_used_map exactly the same as a real answer's would.
+    with tempfile.TemporaryDirectory() as d:
+        log = Path(d) / "interactions.jsonl"
+        p = run("touch", "some-id", "other-id", "--log-file", str(log))
+        records, collected = kb._read_interaction_log(log)
+    used = kb._last_used_map(records) if collected else {}
+    ok = p.returncode == 0 and "some-id" in used and "other-id" in used
+    return ok, f"rc={p.returncode} collected={collected} used_ids={sorted(used)}"
+
+
+@check
+def touch_warns_on_unknown_id_but_still_logs():
+    # An id the local index does not recognise is still recorded (best-effort telemetry, not a gate); the
+    # warning is advisory, printed to stderr, never a refusal.
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d) / "kb"
+        _write(repo / "shared" / "known.md", _nugget(id="known-id", title="Known"))
+        log = Path(d) / "interactions.jsonl"
+        p = run("touch", "unknown-id", "--repo", str(repo), "--log-file", str(log))
+        records, collected = kb._read_interaction_log(log)
+    used = kb._last_used_map(records) if collected else {}
+    warned = "unknown-id" in p.stderr and "warning" in p.stderr.lower()
+    ok = p.returncode == 0 and warned and "unknown-id" in used
+    return ok, f"rc={p.returncode} warned={warned} logged={'unknown-id' in used} stderr={p.stderr.strip()!r}"
+
+
+@check
+def rot_source_stable_extends_like_last_used():
+    # source_stable_ids is a second, independent softener with the exact same shape as last_used_map: it
+    # holds the Outdated flag back up to the hard ceiling, never past it, and never for a never-verified
+    # nugget (use, or a stable source, never excuses the absence of any human verification at all).
+    now = _NOW
+    past_window = kb.ROT_OUTDATED_DAYS + 30
+    over_ceiling = kb.ROT_HARD_CEILING_DAYS + 20
+
+    def nug(nid, days_verified):
+        v = "unverified" if days_verified is None else (now - timedelta(days=days_verified)).strftime("%Y-%m-%d")
+        return _nugget_dict(id=nid, verified=v)
+
+    nuggets = [
+        nug("stable-source", past_window),        # source unchanged, under ceiling -> NOT flagged
+        nug("unstable-source", past_window),       # source not in the stable set -> flagged
+        nug("stable-over-ceiling", over_ceiling),  # source unchanged but over ceiling -> flagged regardless
+        nug("never-verified", None),               # never verified, source unchanged -> flagged regardless
+    ]
+    stable = {"stable-source", "stable-over-ceiling", "never-verified"}
+    flags = kb._rot_flags(nuggets, now, None, stable)
+    outdated = {f["id"] for f in flags if any(r.startswith("Outdated") for r in f["reasons"])}
+    expect = {"unstable-source", "stable-over-ceiling", "never-verified"}
+    ok = outdated == expect
+    return ok, f"flagged={sorted(outdated)} expected={sorted(expect)}"
+
+
+@check
+def rot_both_softeners_are_independent_and_additive():
+    # Either signal alone is enough to hold the flag back; neither is required if the other is present.
+    now = _NOW
+    age = kb.ROT_OUTDATED_DAYS + 30
+    v = (now - timedelta(days=age)).strftime("%Y-%m-%d")
+    nuggets = [
+        _nugget_dict(id="usage-only", verified=v),
+        _nugget_dict(id="source-only", verified=v),
+        _nugget_dict(id="neither", verified=v),
+    ]
+    last_used = {"usage-only": now - timedelta(days=5)}
+    stable = {"source-only"}
+    flags = kb._rot_flags(nuggets, now, last_used, stable)
+    outdated = {f["id"] for f in flags if any(r.startswith("Outdated") for r in f["reasons"])}
+    ok = outdated == {"neither"}
+    return ok, f"flagged={sorted(outdated)} (only 'neither' should be flagged)"
+
+
+@check
+def source_stable_from_file_absent_or_malformed_is_empty_not_a_crash():
+    # A missing or unreadable pin-audit file must degrade to "no softening", exactly as an absent --log-file
+    # does for usage, never raise and never be silently read as "everything is stable".
+    with tempfile.TemporaryDirectory() as d:
+        missing = kb._source_stable_from_file(str(Path(d) / "does-not-exist.json"))
+        bad = Path(d) / "malformed.json"
+        bad.write_text("{not valid json", encoding="utf-8")
+        malformed = kb._source_stable_from_file(str(bad))
+        none_arg = kb._source_stable_from_file(None)
+    ok = missing == set() and malformed == set() and none_arg == set()
+    return ok, f"missing={missing} malformed={malformed} none_arg={none_arg}"
+
+
+@check
+def source_stable_ids_excludes_could_not_look_verdicts():
+    # Only ok/enriched count as stable. Every could-not-look verdict (unfetchable, unpinned-ref,
+    # directory-pointer, external-pointer) and every real-drift verdict must be excluded, not assumed stable.
+    rows = [
+        {"id": "a", "verdict": "ok"},
+        {"id": "b", "verdict": "enriched"},
+        {"id": "c", "verdict": "diverged"},
+        {"id": "d", "verdict": "stale-status"},
+        {"id": "e", "verdict": "stale-tree"},
+        {"id": "f", "verdict": "unpinned-ref"},
+        {"id": "g", "verdict": "unfetchable"},
+        {"id": "h", "verdict": "directory-pointer"},
+        {"id": "i", "verdict": "external-pointer"},
+    ]
+    stable = kb._source_stable_ids(rows)
+    ok = stable == {"a", "b"}
+    return ok, f"stable={sorted(stable)} (expected only a, b)"
+
+
+@check
+def feedback_pin_audit_softens_like_usage_does():
+    # End-to-end through the feedback sweep, mirroring feedback_usage_suppresses_outdated_under_ceiling
+    # exactly, but through the source-stability path: a stale-but-source-stable nugget is held back; drop
+    # the pin-audit file and the same nugget is flagged KB-ROT-OUTDATED.
+    now = datetime.now(timezone.utc)
+    vdate = (now - timedelta(days=kb.ROT_OUTDATED_DAYS + 30)).strftime("%Y-%m-%d")
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d) / "kb"
+        _write(repo / "shared" / "stable-note.md",
+              _nugget(id="stable-note", title="Stable note", verified=vdate))
+        pin_audit = Path(d) / "pin-audit.json"
+        pin_audit.write_text(json.dumps({"rows": [{"id": "stable-note", "verdict": "ok"}]}), encoding="utf-8")
+        p_stable = run("feedback", "--repo", str(repo), "--pin-audit-file", str(pin_audit))
+        p_no_file = run("feedback", "--repo", str(repo))
+    suppressed = p_stable.returncode == 0 and "stable-note" not in p_stable.stdout
+    flagged = "KB-ROT-OUTDATED" in p_no_file.stdout and "stable-note" in p_no_file.stdout
+    ok = suppressed and flagged
+    return ok, f"suppressed_with_pin_audit={suppressed} flagged_without={flagged}"
+
+
+@check
 def index_stamps_last_used_from_log():
     # Single-repo index stamps a derived last_used from the log when given one, and leaves it null otherwise.
     now = datetime.now(timezone.utc)

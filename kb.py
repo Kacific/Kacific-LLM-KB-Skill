@@ -9,7 +9,10 @@ Subcommands:
             linked worktree given by --into (a governed repo's shared main checkout is refused)
   index     walk the KB data repos and rebuild the aggregate registry, then derive per-audience slices
   answer    answer a query using only stored nuggets, with grounding, citation, and confidence
+  touch     record a nugget as genuinely cited, for a read path that does not go through `answer`
   rot       hygiene sweep: flag Redundant / Outdated (verified > 90 days) / Trivial; emit a report
+            (--log-file and --pin-audit-file each optionally soften Outdated for a nugget in real use
+            or whose pinned source has not moved, up to a hard ceiling; omit either for the plain rule)
   sync      git-fetch each managed repo, diff SHA and per-nugget body hash, report drift (1b)
   prescan   one-time seed: scan the manifest's seed-source repos into ranked pointer candidates plus a
             captured-vs-gap report; --commit stages them for human review (secrets-safe by name)
@@ -1019,6 +1022,33 @@ def cmd_index(args) -> int:
     return 0
 
 
+def cmd_touch(args) -> int:
+    """Record that one or more nuggets were genuinely cited in a real answer, from the UNINSTRUMENTED read
+    path. `kb.py answer` logs a hit on the manager's own instrumented path (Path 1 in the `kacific-kb`
+    skill); a session that read a nugget file directly and cited it (Path 2, "the always-available
+    fallback") produces no such record today, which is why the usage-softening half of `rot` has almost
+    nothing to work from in practice: the estate's actual KB consumption is overwhelmingly Path 2. `touch`
+    is the same log entry `answer` already writes on a hit, callable from the read path that does not go
+    through the manager.
+
+    Best-effort by design: it never gates on the id existing in a local index (the caller may be citing a
+    nugget from a repo it has not cloned), and it never touches `verified`. It is a signal for the next
+    `rot`/`feedback` run to consult, not an attestation of anything.
+    """
+    known = set()
+    if args.repo:
+        root = Path(args.repo).expanduser()
+        if root.is_dir():
+            known = {n["meta"]["id"] for n in _load_nuggets(root)}
+    unknown = [i for i in args.ids if known and i not in known]
+    if unknown:
+        print(f"touch: warning, not found under {args.repo}: {', '.join(unknown)} (logged anyway)",
+              file=sys.stderr)
+    _log_interaction({"kind": "touch", "hit": True, "cited": list(args.ids)}, args.log_file)
+    print(f"touch: recorded {len(args.ids)} nugget id(s) as used in {args.log_file}")
+    return 0
+
+
 def cmd_answer(args) -> int:
     root = Path(args.repo)
     nuggets = _load_nuggets(root)
@@ -1131,15 +1161,51 @@ def _last_used_from_logfile(log_file) -> dict:
     return _last_used_map(records) if collected else {}
 
 
-def _rot_flags(nuggets: list[dict], now: datetime, last_used_map: dict | None = None) -> list[dict]:
+def _source_stable_ids(pin_audit_records: list[dict]) -> set:
+    """Return the set of nugget ids a `pin-audit` row judged still grounded in their pinned source.
+
+    Takes rows already parsed from a `pin-audit --json` report (never fetches anything itself: `rot` stays
+    network-free unless a caller explicitly supplies this file, matching how `--log-file` is optional). Only
+    `ok` (body matches source) and `enriched` (hand-improved, still consistent with source) count as stable.
+    Every other verdict is either real drift (`stale-status`, `stale-tree`, `diverged`) or a could-not-look
+    (`unpinned-ref`, `unfetchable`, `directory-pointer`, `external-pointer`), and a could-not-look must never
+    read as an all-clear, so it is excluded rather than assumed stable.
+    """
+    return {r["id"] for r in pin_audit_records if r.get("verdict") in ("ok", "enriched") and r.get("id")}
+
+
+def _source_stable_from_file(pin_audit_file) -> set:
+    """Build the source-stable set from an optional `pin-audit --json` file PATH, or set() when absent,
+    missing, or malformed. Mirrors `_last_used_from_logfile`'s absent-means-empty contract exactly, so a
+    caller that never passes `--pin-audit-file` sees the pre-existing rot behaviour, unchanged."""
+    if not pin_audit_file:
+        return set()
+    try:
+        data = json.loads(Path(pin_audit_file).expanduser().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    return _source_stable_ids(data.get("rows") or [])
+
+
+def _rot_flags(nuggets: list[dict], now: datetime, last_used_map: dict | None = None,
+                source_stable_ids: set | None = None) -> list[dict]:
     """Compute the Redundant / Outdated / Trivial flags for a nugget set. The single source of the ROT rules.
 
     Both `rot` (which reports them, grouped by owner) and `feedback` (which turns them into audit-family
     findings) call this, so the flag rules live in exactly one place. Each flag is {id, path, owner, reasons}.
 
-    `last_used_map` (nugget id -> last-used datetime, from `_last_used_map`) softens the Outdated rule: a
-    nugget in active use inside USAGE_WINDOW_DAYS is not flagged Outdated until it also crosses
-    ROT_HARD_CEILING_DAYS. An empty or absent map reproduces the pre-usage behaviour exactly.
+    Two INDEPENDENT signals soften the Outdated rule, either of which is enough to hold a nugget back until
+    it also crosses ROT_HARD_CEILING_DAYS, past which it is flagged regardless of both:
+
+    - `last_used_map` (nugget id -> last-used datetime, from `_last_used_map`): a nugget cited in a real
+      answer inside USAGE_WINDOW_DAYS is "in active use".
+    - `source_stable_ids` (a set of nugget ids, from `_source_stable_ids`): a nugget whose pinned source has
+      not materially drifted since the pin (a `pin-audit` verdict of `ok` or `enriched`) is "still grounded".
+
+    Both are additive-only: an empty or absent map/set reproduces the pre-usage behaviour exactly, so a
+    caller that supplies neither gets the original 30-day-only rule unchanged. Neither is ever a substitute
+    for `verified`: usage and source stability are not human confirmation, so `verified` stays a human-only
+    field (per schema/kb-entry.md) and a nugget past the ceiling is flagged regardless of either signal.
     """
     by_id: dict = {}
     by_source: dict = {}
@@ -1164,7 +1230,8 @@ def _rot_flags(nuggets: list[dict], now: datetime, last_used_map: dict | None = 
             age = (now - verified).days
             last_used = (last_used_map or {}).get(m["id"])
             used_recently = last_used is not None and (now - last_used).days <= USAGE_WINDOW_DAYS
-            if not (used_recently and age <= ROT_HARD_CEILING_DAYS):
+            source_stable = m["id"] in (source_stable_ids or set())
+            if not ((used_recently or source_stable) and age <= ROT_HARD_CEILING_DAYS):
                 reasons.append(f"Outdated (verified {age} days ago)")
         if len(by_id[m["id"]]) > 1:
             reasons.append("Redundant (duplicate id)")
@@ -1191,7 +1258,8 @@ def _rot_flags(nuggets: list[dict], now: datetime, last_used_map: dict | None = 
 def cmd_rot(args) -> int:
     nuggets = _load_nuggets(Path(args.repo))
     last_used = _last_used_from_logfile(getattr(args, "log_file", None))
-    flags = _rot_flags(nuggets, datetime.now(timezone.utc), last_used)
+    source_stable = _source_stable_from_file(getattr(args, "pin_audit_file", None))
+    flags = _rot_flags(nuggets, datetime.now(timezone.utc), last_used, source_stable)
 
     if not flags:
         print(f"rot: clean. {len(nuggets)} nuggets, none flagged.")
@@ -1981,9 +2049,13 @@ def cmd_feedback(args) -> int:
             rot_collected = True
             # Usage softens the Outdated flag: a nugget cited by a recent hit answer is left alone until the
             # hard ceiling. The signal comes from the same interaction log this sweep already read; if the log
-            # was not collected the map is empty and the rule behaves exactly as before.
+            # was not collected the map is empty and the rule behaves exactly as before. Source stability is
+            # the second, independent softener, read from an already-generated `pin-audit --json` file so this
+            # sweep never fetches from GitHub itself; omitted, it is empty and the rule is unchanged.
             last_used = _last_used_map(records) if log_collected else {}
-            findings.extend(_rot_findings(_rot_flags(nuggets, datetime.now(timezone.utc), last_used)))
+            source_stable = _source_stable_from_file(getattr(args, "pin_audit_file", None))
+            findings.extend(_rot_findings(
+                _rot_flags(nuggets, datetime.now(timezone.utc), last_used, source_stable)))
         else:
             # A mis-pointed or empty --repo reads identically to "collected, found nothing", which would let
             # the reconcile auto-clear every ROT task. Treat zero nuggets as NOT collected (the active-family
@@ -3330,7 +3402,22 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--log-file",
                     help="interaction log to read usage from; a nugget cited by a recent hit answer is held "
                          "back from the Outdated flag until the hard ceiling (omit to disable usage softening)")
+    sp.add_argument("--pin-audit-file",
+                    help="a prior `pin-audit --json` report; a nugget whose verdict is ok or enriched is held "
+                         "back from the Outdated flag the same way usage is (omit to disable this softening; "
+                         "rot never fetches from GitHub itself, so this file must already exist)")
     sp.set_defaults(func=cmd_rot)
+
+    sp = sub.add_parser("touch",
+                        help="record that a nugget was actually cited in a real answer (the uninstrumented "
+                             "read path's equivalent of the logging `answer` already does on a hit)")
+    sp.add_argument("ids", nargs="+", help="one or more nugget ids that were genuinely cited")
+    sp.add_argument("--repo",
+                    help="KB repo root to check the ids against (optional; a name not found there is still "
+                         "logged, with a warning, since this is a signal for rot to consult, not a gate)")
+    sp.add_argument("--log-file", default="logs/interactions.jsonl",
+                    help="interaction log to append to (default: logs/interactions.jsonl)")
+    sp.set_defaults(func=cmd_touch)
 
     sp = sub.add_parser("sync", help="drift-detect managed repos against the recorded aggregate")
     sp.add_argument("--config", default="config.toml", help="path to config.toml")
@@ -3349,6 +3436,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--repo", help="KB repo root to sweep for ROT findings (omit to skip the ROT family)")
     sp.add_argument("--log-file", default="logs/interactions.jsonl",
                     help="interaction log to read gap/conflict signals from (default: logs/interactions.jsonl)")
+    sp.add_argument("--pin-audit-file",
+                    help="a prior `pin-audit --json` report; a ROT-OUTDATED finding is held back the same way "
+                         "usage is when the nugget's verdict there was ok or enriched (omit to disable; this "
+                         "sweep never fetches from GitHub itself)")
     sp.add_argument("--log", action="store_true",
                     help="append one usage/rating/miss record instead of reporting (needs --query)")
     sp.add_argument("--kind", choices=["gap", "miss", "rating"], help="record kind for --log (default: gap)")
