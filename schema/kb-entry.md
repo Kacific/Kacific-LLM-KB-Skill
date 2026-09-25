@@ -29,6 +29,7 @@ verified_by_name: <display name>   # OPTIONAL readable twin of verified_by, as o
 supersedes: <id | null>        # the id this nugget replaces, if any
 related: [<id>, ...]           # companion nuggets, by id (relative links)
 tags: [<tag>, ...]
+shares_source_ok: true         # OPTIONAL; see "Sharing a source deliberately" below
 ---
 ```
 
@@ -54,6 +55,25 @@ abstract only; a pointer never copies source content.
 `status: draft` with the reviewing human as owner, and they enter the KB only through the normal
 `store --into` gate after review. A repo-root pointer records that a repo is covered at repo level; it does
 not preclude finer per-file pointers into the same repo.
+
+## Sharing a source deliberately
+
+`kb.py rot` flags two nuggets that carry the same `source` string as `Redundant (shares source with
+another nugget)`, on the assumption that one source backs one nugget. Two real shapes break that
+assumption without being duplicates:
+
+- **A source that is inherently one-source-many-files.** A Box folder link (Box has no stable per-file
+  deep link) or a GitHub `tree` directory URL covers several genuinely distinct topics by the platform's
+  own design. `rot` recognises these URL shapes and never flags on the shared source alone; no frontmatter
+  change is needed.
+- **A single file deliberately split into more than one nugget.** When a human splits one source document
+  into several nuggets on purpose (a general pointer plus one named section, for example), set
+  `shares_source_ok: true` on every nugget in that deliberate split. It is per-nugget: a nugget without the
+  field still flags even if its sibling carries it.
+
+Neither exemption is a substitute for checking that the split is real. Two nuggets sharing a specific
+file/blob URL or a plain doc path, with neither an inherently-multi source shape nor the opt-out, is a
+genuine duplicate and `rot` flags it exactly as before.
 
 ## Ownership
 
