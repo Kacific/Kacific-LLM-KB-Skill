@@ -160,7 +160,7 @@ _FM_FIELD_ORDER = [
     "schema_version", "id", "title", "domain", "type", "status", "owner_gid", "owner_name",
     "provenance_type", "source", "attested_by", "attested_by_name", "attested_on", "confidence",
     "verified", "verified_by", "verified_by_name",
-    "supersedes", "related", "tags",
+    "supersedes", "related", "tags", "shares_source_ok",
 ]
 
 
@@ -1187,6 +1187,24 @@ def _source_stable_from_file(pin_audit_file) -> set:
     return _source_stable_ids(data.get("rows") or [])
 
 
+def _source_is_inherently_multi(source) -> bool:
+    """True when a source URL structurally backs several distinct files by the platform's own design.
+
+    A Box folder link (Box has no stable per-file deep link) or a GitHub `tree` URL (a directory listing,
+    not one file's blob) legitimately grounds more than one nugget at once, so two nuggets sharing one of
+    these is not on its own evidence of duplication the way sharing a specific file/blob URL is. Sharing
+    any OTHER kind of source (a blob URL, a plain doc path) still flags, unless `shares_source_ok` opts it
+    out explicitly (see `_rot_flags`).
+    """
+    if not source:
+        return False
+    return bool(re.search(r"box\.com/folder/", source) or re.search(r"github\.com/[^/]+/[^/]+/tree/", source))
+
+
+def _truthy(value) -> bool:
+    return str(value).strip().lower() in {"true", "yes", "1"}
+
+
 def _rot_flags(nuggets: list[dict], now: datetime, last_used_map: dict | None = None,
                 source_stable_ids: set | None = None) -> list[dict]:
     """Compute the Redundant / Outdated / Trivial flags for a nugget set. The single source of the ROT rules.
@@ -1206,6 +1224,18 @@ def _rot_flags(nuggets: list[dict], now: datetime, last_used_map: dict | None = 
     caller that supplies neither gets the original 30-day-only rule unchanged. Neither is ever a substitute
     for `verified`: usage and source stability are not human confirmation, so `verified` stays a human-only
     field (per schema/kb-entry.md) and a nugget past the ceiling is flagged regardless of either signal.
+
+    The "shares source" Redundant rule has two similar exemptions, since sharing a source string is not
+    always duplication:
+
+    - a source that is inherently one-source-many-files by the platform's own design (a Box folder link,
+      a GitHub `tree` directory URL; see `_source_is_inherently_multi`) never triggers the rule on its own.
+    - `shares_source_ok: true` in frontmatter is an explicit human opt-out for a single file deliberately
+      split into several nuggets on purpose (schema/kb-entry.md). It is per-nugget, so every nugget in the
+      deliberate split carries it.
+
+    Neither exemption is a substitute for a real duplicate: two nuggets sharing a specific file/blob URL or
+    plain doc path, with neither the multi-file shape nor the opt-out, still flags exactly as before.
     """
     by_id: dict = {}
     by_source: dict = {}
@@ -1235,7 +1265,9 @@ def _rot_flags(nuggets: list[dict], now: datetime, last_used_map: dict | None = 
                 reasons.append(f"Outdated (verified {age} days ago)")
         if len(by_id[m["id"]]) > 1:
             reasons.append("Redundant (duplicate id)")
-        if m.get("source") and len(by_source[m["source"]]) > 1:
+        if (m.get("source") and len(by_source[m["source"]]) > 1
+                and not _truthy(m.get("shares_source_ok"))
+                and not _source_is_inherently_multi(m["source"])):
             reasons.append("Redundant (shares source with another nugget)")
         if m["id"] in superseded:
             reasons.append("Redundant (superseded by another nugget)")

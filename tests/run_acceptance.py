@@ -468,6 +468,84 @@ def rot_both_softeners_are_independent_and_additive():
 
 
 @check
+def rot_shared_box_folder_link_is_not_redundant():
+    # Shape 1 from GitHub issue #45: a Box folder link has no stable per-file deep link, so several
+    # genuinely distinct nuggets pinning the same /folder/ URL must not be flagged Redundant on that
+    # basis alone.
+    now = _NOW
+    nuggets = [
+        _nugget_dict(id="box-a", source="https://kacific.app.box.com/folder/344157674063"),
+        _nugget_dict(id="box-b", source="https://kacific.app.box.com/folder/344157674063"),
+        _nugget_dict(id="box-c", source="https://kacific.app.box.com/folder/344157674063"),
+    ]
+    flags = kb._rot_flags(nuggets, now)
+    redundant = {f["id"] for f in flags if any("shares source" in r for r in f["reasons"])}
+    ok = redundant == set()
+    return ok, f"redundant={sorted(redundant)} (want none; box folder links are inherently multi-file)"
+
+
+@check
+def rot_shared_github_tree_link_is_not_redundant():
+    # Shape 1's GitHub counterpart: a /tree/ URL is a directory listing, not one file's blob.
+    now = _NOW
+    nuggets = [
+        _nugget_dict(id="tree-a", source="https://github.com/Kacific/Some-Repo/tree/main/docs"),
+        _nugget_dict(id="tree-b", source="https://github.com/Kacific/Some-Repo/tree/main/docs"),
+    ]
+    flags = kb._rot_flags(nuggets, now)
+    redundant = {f["id"] for f in flags if any("shares source" in r for r in f["reasons"])}
+    ok = redundant == set()
+    return ok, f"redundant={sorted(redundant)} (want none; a github tree URL is a directory listing)"
+
+
+@check
+def rot_shares_source_ok_opts_out_a_deliberate_split():
+    # Shape 2 from GitHub issue #45: a single file deliberately split into two nuggets (a general pointer
+    # plus one named section) opts out per-nugget via shares_source_ok: true.
+    now = _NOW
+    blob = "https://github.com/Kacific/Kacific-Cyber-Audit/blob/deadbeef/README.md"
+    nuggets = [
+        _nugget_dict(id="readme-general", source=blob, shares_source_ok="true"),
+        _nugget_dict(id="readme-named-section", source=blob, shares_source_ok="true"),
+    ]
+    flags = kb._rot_flags(nuggets, now)
+    redundant = {f["id"] for f in flags if any("shares source" in r for r in f["reasons"])}
+    ok = redundant == set()
+    return ok, f"redundant={sorted(redundant)} (want none; both nuggets opt out)"
+
+
+@check
+def rot_shares_source_ok_is_per_nugget_not_the_pair():
+    # The opt-out is per-nugget: a sibling without it still flags even though the other carries it, so a
+    # human must set it deliberately on every nugget in the split rather than relying on one to cover both.
+    now = _NOW
+    blob = "https://github.com/Kacific/Kacific-Cyber-Audit/blob/deadbeef/README.md"
+    nuggets = [
+        _nugget_dict(id="opted-out", source=blob, shares_source_ok="true"),
+        _nugget_dict(id="not-opted-out", source=blob),
+    ]
+    flags = kb._rot_flags(nuggets, now)
+    redundant = {f["id"] for f in flags if any("shares source" in r for r in f["reasons"])}
+    ok = redundant == {"not-opted-out"}
+    return ok, f"redundant={sorted(redundant)} (want only 'not-opted-out')"
+
+
+@check
+def rot_genuine_duplicate_source_still_flags():
+    # Regression guard: a plain (non-Box-folder, non-GitHub-tree) shared source with no shares_source_ok
+    # opt-out is a genuine duplicate and must still be flagged Redundant, exactly as before this fix.
+    now = _NOW
+    nuggets = [
+        _nugget_dict(id="dup-a", source="https://example.invalid/docs/password-policy"),
+        _nugget_dict(id="dup-b", source="https://example.invalid/docs/password-policy"),
+    ]
+    flags = kb._rot_flags(nuggets, now)
+    redundant = {f["id"] for f in flags if any("shares source" in r for r in f["reasons"])}
+    ok = redundant == {"dup-a", "dup-b"}
+    return ok, f"redundant={sorted(redundant)} (want both; this is a real duplicate)"
+
+
+@check
 def source_stable_from_file_absent_or_malformed_is_empty_not_a_crash():
     # A missing or unreadable pin-audit file must degrade to "no softening", exactly as an absent --log-file
     # does for usage, never raise and never be silently read as "everything is stable".
