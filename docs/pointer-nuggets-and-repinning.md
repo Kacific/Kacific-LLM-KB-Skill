@@ -172,7 +172,7 @@ standard output.
 
 | Verdict | Meaning |
 |---|---|
-| `stale-status` | the body calls the work open while the source calls it closed; checked for every pointer |
+| `stale-status` | the body calls the work open while the source calls it closed; checked for every pointer whose pinned file could be read, hand-written or generated |
 | `ok`, empty detail | a generated body that still reproduces exactly from the source |
 | `ok`, detail `hand-written body; status-checked only` | **nothing was checked beyond the status line** |
 | `enriched` | the body says more than the generator reads, and every backticked or bolded term it uses is in the source |
@@ -184,7 +184,7 @@ standard output.
 
 ### Three checks, and what they leave out
 
-`pin-audit` runs exactly three checks: a status contradiction between body and source; for a nugget tagged
+For each pinned file it can read, `pin-audit` runs three checks: a status contradiction between body and source; for a nugget tagged
 `prescan`, whether the body is what the generator would write from the source today; and, if it is not,
 whether every backticked identifier and bolded phrase in the body appears in the source. A clean verdict
 therefore means only that none of those found a problem. It does not mean the body is true.
@@ -228,8 +228,8 @@ the row moves to `enriched`. Three cautions:
   flagged.
 - **Do not backtick anything shorter than four characters.** A three-character span does not match as a
   term, and the extractor then pairs its closing backtick with the next opening one and extracts the prose
-  between them. Checked directly: ``one `/16` per teleport, a `/25` per NPCI`` yields the single term
-  `' per teleport, a '`, which is not in the source, so the row stays `diverged` for a reason invisible in the
+  between them. Checked directly: ``one `/16` per site, a `/25` per rack`` yields the single term
+  `' per site, a '`, which is not in the source, so the row stays `diverged` for a reason invisible in the
   marked-up text.
 - **Do not mark up a row that already reads `ok` with an empty detail.** Its body is the generator's own
   output, so regeneration equality already checks every word. Hand markup breaks that equality for good and
@@ -294,8 +294,8 @@ this repository, and this file makes no claim about what `sync` returns to the s
 ## 5. `verified` through a re-pin
 
 `kb.py` never clears or bumps `verified`, `verified_by` or `verified_by_name` on a nugget that exists. `store`
-writes the file verbatim, and the only logic that reads those fields is validation, the age test in `rot` and
-`verify-audit`; the one place it writes `verified` is `prescan --commit`, which stages brand-new candidates as
+writes the file verbatim. Those fields are read by validation, the age test in `rot`, `verify-audit`, the reader
+footnote that `answer` and `export` add, and the registry's `last_verified`; none of them writes. The one place it writes `verified` is `prescan --commit`, which stages brand-new candidates as
 `unverified`. The field is defined in the schema as
 the last **human** verification, so every rule below falls on whoever edits the nugget; no tool will catch a
 mistake here.
