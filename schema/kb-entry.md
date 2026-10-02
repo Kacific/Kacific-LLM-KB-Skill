@@ -56,6 +56,10 @@ abstract only; a pointer never copies source content.
 `store --into` gate after review. A repo-root pointer records that a repo is covered at repo level; it does
 not preclude finer per-file pointers into the same repo.
 
+A pinned pointer does not follow its source forward. How to tell that one has gone stale, how to re-pin it
+through the manager, and what `kb.py pin-audit` can and cannot see are in
+[`docs/pointer-nuggets-and-repinning.md`](../docs/pointer-nuggets-and-repinning.md).
+
 ## Sharing a source deliberately
 
 `kb.py rot` flags two nuggets that carry the same `source` string as `Redundant (shares source with
