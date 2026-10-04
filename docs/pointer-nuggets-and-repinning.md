@@ -140,13 +140,18 @@ shared base entries every published slice carries.
 - `unchanged` after your merge means the published slice already equals what the merged data produces.
   Either a peer published first, or your edit changed no field the registry carries. Check which before
   assuming a change is missing. The comparison is with the `registry.json` in the tool's own clone of the
-  data repository, which equals the remote's file only after a fresh fetch and reset (the next sections
-  show the case where it does not).
-- Each run fetches every managed repository, unless a fetch TTL says otherwise. With a positive TTL
-  (`fetch_ttl_seconds` under `[cache]` in `config.toml`, or `--max-age` on the command) a repository
-  fetched within the window is not fetched again, so the aggregate, and any publish built from it, can
+  data repository, and a publish run fetches and hard-resets that clone first, so the file it compares
+  against is the remote's.
+- A run without `--publish` fetches every managed repository unless a fetch TTL says otherwise. With a
+  positive TTL (`fetch_ttl_seconds` under `[cache]` in `config.toml`, or `--max-age` on the command) a
+  repository fetched within the window is not fetched again, so the aggregate and the review slices can
   lack a merge made since. The default is 0, which always fetches. `--force` fetches regardless of the
   TTL, and `sync` always fetches.
+- `--publish` fetches every managed repository whatever the TTL says, and ignores `--max-age`, because a
+  publish has to start from each remote's head. So a review pass run under a TTL a moment earlier can
+  differ from what the publish then writes; read the publish output instead of assuming the two match.
+  This changed after commit `93a0d9c`. Up to and including that commit a publish honoured the TTL, which
+  is the sharp edge described under the failed-push heading below.
 - The registry's `last_verified` is read from each nugget's `verified` on the default branch at the moment
   of the run. A publish therefore carries whatever `verified` is there, right or wrong, and a merge without
   its publish leaves readers on the previous registry until someone publishes.
@@ -185,16 +190,23 @@ the wrong first move. Instead:
    with the data repository's `registry.json`, read by git ref (below).
 2. Equal entries mean your entry landed. Publishing again reports `unchanged` for that slice and makes no
    commit.
-3. Differing entries mean it did not. Publish again with `--force`.
+3. Differing entries mean it did not. Publish again. The run fetches fresh, so it starts from the
+   remote's head and carries any peer merge or publish that arrived since.
 
-**`--force` matters here.** A failed push leaves its commit in the tool's own clone, and the registry file
-that commit wrote stays on disk. A fresh fetch hard-resets that clone to the remote, which discards the
-stranded commit, so the next run starts clean. A run that reuses the clone under a positive TTL does not
-reset it, compares your entries with the file it wrote itself, and reports `unchanged` while the remote
-still lacks them. Checked by making a scratch remote reject pushes, lifting the rejection, and retrying
-inside the TTL: `unchanged`, nothing on the remote, the stranded commit still in the clone. The same retry
-with `--force` published. So with a TTL configured, `unchanged` after a failed push proves nothing until you
-have read the remote.
+**A retry starts from the remote.** A failed push leaves its commit in the tool's own clone, and the
+registry file that commit wrote stays on disk. Every publish run fetches and hard-resets that clone to the
+remote before it compares anything, which discards the stranded commit, so the retry rebuilds from the
+remote head and `unchanged` means the remote already holds the entries. `--force` is not needed for this.
+The acceptance harness pins both shapes: a remote made to reject pushes and then lifted, and the same with
+a peer commit landing in between, each retried under `--max-age 3600`.
+
+**The sharp edge that existed up to `93a0d9c`, kept because older checkouts still have it.** Until then a
+publish honoured a positive TTL. A retry inside the window reused the clone without resetting it, compared
+your entries with the file the failed run had written there, and reported `unchanged` while the remote still
+lacked them. Checked by making a scratch remote reject pushes, lifting the rejection, and retrying inside
+the TTL: `unchanged`, nothing on the remote, the stranded commit still in the clone. The same retry with
+`--force` published. On such a checkout, with a TTL configured, `unchanged` after a failed push proves
+nothing until you have read the remote, and the workaround is `--force`.
 
 **A run killed part-way is the same case from the other end.** Slices already pushed stay pushed. The
 aggregate file that `sync` uses as its baseline is written only after the last slice, so a killed run

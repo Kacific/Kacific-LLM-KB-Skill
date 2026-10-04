@@ -637,6 +637,125 @@ def index_publish_slices_are_scoped_idempotent_and_clean():
                     f"clean={clean} sync={s.stdout.strip()!r}")
 
 
+def _reject_pushes(root: Path, key: str) -> Path:
+    """Make a bare remote refuse every push, the way a missing write grant or a failing server hook does."""
+    hook = root / f"{key}.git" / "hooks" / "pre-receive"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    hook.write_text("#!/bin/sh\necho 'push rejected by test hook' >&2\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+    return hook
+
+
+def _remote_registry_ids(url: str, scratch: Path) -> set | None:
+    """The entry ids in a remote's registry.json, read from a fresh clone so no local cache can answer.
+
+    None means the remote carries no registry.json at all, which is a different answer from an empty one.
+    """
+    if scratch.exists():
+        raise RuntimeError(f"scratch path {scratch} already exists; use a fresh name per read")
+    git("clone", "--quiet", url, str(scratch))
+    reg = scratch / "registry.json"
+    if not reg.exists():
+        return None
+    return {e["id"] for e in json.loads(reg.read_text(encoding="utf-8"))["entries"]}
+
+
+def _peer_commit(root: Path, key: str, writes: dict) -> None:
+    """commit_to_remote, after catching the seeding clone up with a publish the manager pushed in between."""
+    git("-C", str(root / f"{key}-work"), "pull", "--quiet", "--ff-only", "origin", "main")
+    commit_to_remote(root, key, writes=writes)
+
+
+def _publish_commit_count(url: str) -> int:
+    """How many manager publish commits the remote's main carries, by subject."""
+    subjects = git("--git-dir", url.removeprefix("file://"), "log", "--format=%s", "main").stdout.splitlines()
+    return sum(1 for s in subjects if s.startswith("kb: publish registry slice"))
+
+
+def _failed_push_setup(d: str):
+    """One AllStaff remote, a clean baseline publish, a new nugget upstream, then a publish whose push is refused.
+
+    Returns ((root, admin, cfg, url, cache), "") when the push was refused as designed, or (None, reason)
+    when the setup itself went wrong. The control assertions live here, so both callers know the failure
+    they are about to retry really happened and really left the remote short.
+    """
+    root = Path(d)
+    admin = root / "admin"; admin.mkdir()
+    cache = root / "cache"
+    url = make_remote(root, "allstaff", {
+        "shared/wifi.md": nugget("shared-wifi", "shared", "Wifi", "Join the staff SSID to get online."),
+    })
+    cfg = write_manifest(admin, cache, {"allstaff": (url, "AllStaff")})
+    base = kb("index", "--manifest", "--publish", "--config", str(cfg))
+    if base.returncode != 0 or "publish allstaff: published" not in base.stdout:
+        return None, f"baseline publish rc={base.returncode} stdout={base.stdout.strip()!r}"
+    _peer_commit(root, "allstaff", {
+        "shared/guide.md": nugget("shared-guide", "shared", "Guide", "A brand new starter guide entry."),
+    })
+    hook = _reject_pushes(root, "allstaff")
+    failed = kb("index", "--manifest", "--publish", "--force", "--config", str(cfg))
+    short = _remote_registry_ids(url, root / "verify-after-failure")
+    if "publish allstaff: publish failed (push" not in failed.stdout or short != {"shared-wifi"}:
+        return None, f"setup did not fail as designed: stdout={failed.stdout.strip()!r} remote_ids={short}"
+    hook.unlink()
+    return (root, admin, cfg, url, cache), ""
+
+
+@check
+def publish_retry_inside_ttl_after_failed_push_still_publishes():
+    """A refused push leaves a commit in the tool's own clone; a TTL-bound retry must not mistake it for success.
+
+    Before the fix the retry compared its entries with the registry file the failed run had already written
+    into that clone, printed `unchanged`, and pushed nothing, so the remote kept lacking the entry while the
+    stranded commit sat in the clone. Publishing now fetches fresh whatever the TTL says.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        state, why = _failed_push_setup(d)
+        if state is None:
+            return False, why
+        root, admin, cfg, url, cache = state
+        retry = kb("index", "--manifest", "--publish", "--max-age", "3600", "--config", str(cfg))
+        ids = _remote_registry_ids(url, root / "verify-after-retry")
+        stranded = git("-C", str(cache / "allstaff"), "log", "--oneline", "origin/main..HEAD").stdout.strip()
+        publishes = _publish_commit_count(url)
+        ok = (
+            retry.returncode == 0
+            and "publish allstaff: published" in retry.stdout
+            and ids == {"shared-wifi", "shared-guide"}
+            and stranded == ""        # the tool's clone no longer carries the commit that never reached the remote
+            and publishes == 2        # the baseline and this one: the stranded commit was not pushed as well
+        )
+        return ok, (f"retry={retry.stdout.strip()!r} remote_ids={sorted(ids or [])} "
+                    f"stranded={stranded!r} publish_commits={publishes}")
+
+
+@check
+def publish_retry_after_failed_push_and_a_peer_commit_publishes_both():
+    """The lost-race shape: the push failed, then a peer moved the remote before the retry, inside the TTL.
+
+    The stranded commit is now also non-fast-forward against the remote. The retry must start from the
+    remote's head, so it carries the peer's entry as well as the one the failed run was trying to publish.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        state, why = _failed_push_setup(d)
+        if state is None:
+            return False, why
+        root, admin, cfg, url, cache = state
+        _peer_commit(root, "allstaff", {
+            "shared/faq.md": nugget("shared-faq", "shared", "FAQ", "Another fresh entry from a peer session."),
+        })
+        retry = kb("index", "--manifest", "--publish", "--max-age", "3600", "--config", str(cfg))
+        ids = _remote_registry_ids(url, root / "verify-after-retry")
+        stranded = git("-C", str(cache / "allstaff"), "log", "--oneline", "origin/main..HEAD").stdout.strip()
+        ok = (
+            retry.returncode == 0
+            and "publish allstaff: published" in retry.stdout
+            and ids == {"shared-wifi", "shared-guide", "shared-faq"}
+            and stranded == ""
+        )
+        return ok, f"retry={retry.stdout.strip()!r} remote_ids={sorted(ids or [])} stranded={stranded!r}"
+
+
 @check
 def export_manifest_bundles_are_scoped_per_audience():
     """export --manifest writes one leak-safe bundle per audience: docs + a valid bundle.json.
