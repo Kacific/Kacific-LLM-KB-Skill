@@ -8,6 +8,10 @@ site-specific identifiers; the examples use made-up names (`example-org/example-
 
 Checked against `kb.py` at commit `63cb2a6`, by running the commands and functions named below against
 scratch fixtures rather than by reading the code alone. Where this file says "today" it means that commit.
+A later pass added the passages on old and new pins, the `prescan` tag, a failed or killed publish, `sync`
+after a commit that changed no nugget, the two `unfetchable` texts and how a remote is read. `kb.py` is the
+same file at `066b643`, and those cases were run the same way: the audit ones through `audit_pin_row` and
+`pin-audit` with the fetch replaced by a local read, the publish and `sync` ones on scratch bare remotes.
 The format of a nugget is in [`schema/kb-entry.md`](../schema/kb-entry.md), and the first-run setup, the
 Python version split and the write-path guard are in the repository's [`CLAUDE.md`](../CLAUDE.md); neither
 is repeated here.
@@ -60,6 +64,16 @@ Read the three results together:
   being served the right text. The pin is only behind by convention (for example the file was edited and
   then reverted). Re-pinning is tidy but not urgent.
 - The two blob ids **differ**: the pointer is genuinely stale and readers are being served old text.
+
+This comparison is the only thing that finds a stale blob pin. `pin-audit` cannot, because its verdict is
+the same at the old pin and at the new one (section 4).
+
+**Count the equal-blob case and the differing-blob case apart when you sweep.** A tally of every pointer
+whose pin is not the last-touching commit puts the equal-blob pointers in with the genuinely stale ones, so
+"N stale" overstates how many readers are being served old text. A tally of blob differences alone hides
+how many pins are merely behind. Report both numbers, each with its name, and deal with the blob
+differences first. Neither number is the count of nuggets that need a body rewrite, which comes only from
+reading the bodies.
 
 For a directory pin, use `git log -1 --format=%H origin/<default-branch> -- <dir>` and compare
 `git ls-tree --name-only <pin> <dir>/` with the same listing at the branch tip.
@@ -125,7 +139,17 @@ shared base entries every published slice carries.
   the publish.
 - `unchanged` after your merge means the published slice already equals what the merged data produces.
   Either a peer published first, or your edit changed no field the registry carries. Check which before
-  assuming a change is missing.
+  assuming a change is missing. The comparison is with the `registry.json` in the tool's own clone of the
+  data repository, which equals the remote's file only after a fresh fetch and reset (the next sections
+  show the case where it does not).
+- Each run fetches every managed repository, unless a fetch TTL says otherwise. With a positive TTL
+  (`fetch_ttl_seconds` under `[cache]` in `config.toml`, or `--max-age` on the command) a repository
+  fetched within the window is not fetched again, so the aggregate, and any publish built from it, can
+  lack a merge made since. The default is 0, which always fetches. `--force` fetches regardless of the
+  TTL, and `sync` always fetches.
+- The registry's `last_verified` is read from each nugget's `verified` on the default branch at the moment
+  of the run. A publish therefore carries whatever `verified` is there, right or wrong, and a merge without
+  its publish leaves readers on the previous registry until someone publishes.
 
 ### Do not publish from a partial aggregate
 
@@ -143,6 +167,49 @@ The partial aggregate is also written to the recorded aggregate file, which is t
 against. Until a complete run replaces it, `sync` reports the missing repository as `recorded none -> live
 <sha>` with its nuggets as `added`. That is a stale baseline, not drift in the repository.
 
+### A publish that fails on one slice, and one that is killed
+
+`--publish` pushes the slices one at a time, in order of repository key, and each push is final. A slice
+whose push fails is reported as `publish <key>: publish failed (push; write access?)` and the run carries
+on with the next. The hint is a guess: the same text covers a rejected push, a missing credential and a
+timeout.
+
+**The failure may be a lost race, which is not a failed write.** If a peer's merge or publish reaches that
+repository between your fetch and your push, the push is rejected as non-fast-forward. This was reproduced
+on scratch bare remotes by holding one push while a second control home published: the second run pushed a
+slice that already carried the new entry, and the held push was then rejected. A publish rebuilds from
+every repository's remote head, so the peer's publish can already hold your entry, and retrying blind is
+the wrong first move. Instead:
+
+1. Run the review pass again (`kb.py index --manifest`, no `--publish`) and compare each slice's entries
+   with the data repository's `registry.json`, read by git ref (below).
+2. Equal entries mean your entry landed. Publishing again reports `unchanged` for that slice and makes no
+   commit.
+3. Differing entries mean it did not. Publish again with `--force`.
+
+**`--force` matters here.** A failed push leaves its commit in the tool's own clone, and the registry file
+that commit wrote stays on disk. A fresh fetch hard-resets that clone to the remote, which discards the
+stranded commit, so the next run starts clean. A run that reuses the clone under a positive TTL does not
+reset it, compares your entries with the file it wrote itself, and reports `unchanged` while the remote
+still lacks them. Checked by making a scratch remote reject pushes, lifting the rejection, and retrying
+inside the TTL: `unchanged`, nothing on the remote, the stranded commit still in the clone. The same retry
+with `--force` published. So with a TTL configured, `unchanged` after a failed push proves nothing until you
+have read the remote.
+
+**A run killed part-way is the same case from the other end.** Slices already pushed stay pushed. The
+aggregate file that `sync` uses as its baseline is written only after the last slice, so a killed run
+leaves the old baseline behind. Checked by killing a run while its second push was held: the first slice
+was on the remote, the second was not, the baseline file was byte-identical to before, and `sync` then
+reported `repo changed` for the repository whose slice had landed. Read each remote's `registry.json` and
+its head commit before running the publish again. The re-run publishes only the slices still behind and
+reports `unchanged` for the rest.
+
+`kb.py` does set time limits: 180 seconds on each git command it runs and 30 seconds on each `pin-audit`
+request. A git command that runs out of time is reported with the same text as any other failure (an
+unreachable repository for a fetch, a failed publish for a push), and the process it stopped may have
+finished its work on the remote first. That is one more reason to read the remote before retrying, and one
+more reason not to blame a missing limit for a run that seems to hang.
+
 ### Verify by content, not by commit id
 
 A squash merge and a publish both carry **content** into a repository without carrying the **commit**.
@@ -150,8 +217,25 @@ The publish writes its own commit in each data repo, so a search for the nugget'
 repositories finds nothing and reads as absence. Instead, read each remote `registry.json` and check that
 the new pin is present, the old one is absent, and an entry you did not touch is still there as a control.
 
+**Read the remote by git ref.** `git fetch`, then `git show origin/<default-branch>:registry.json`, answers
+for a named commit, and `git ls-remote` gives the tip with no clone at all. That is how `kb.py` itself
+reads every managed repository, so it is the read that speaks for what the tool published. A raw-content
+web URL is a cached front end, not part of `kb.py`: when this was written its host sent a five-minute
+cache lifetime in its response headers, so it can show the previous registry straight after a publish. A
+clone you have not fetched can do the same. Neither is evidence against a publish that a ref read
+confirms.
+
 Then `git fetch` and `git pull --ff-only` every local clone the publish touched, after the publish and not
 only after the merge. A clean `git status` says nothing about how far behind the remote a branch is.
+
+**Reading back a branch deletion.** After deleting a branch such as `kb/repin-example-1` on the remote,
+confirm it by the exact name. A call to the hosting API that lists "matching refs" for
+`heads/kb/repin-example-1` is a **prefix** match, so it still returns the branch's siblings
+`kb/repin-example-1-2` and `kb/repin-example-1-3`, and the delete looks as if it failed. Checked against
+this repository: the matching-refs call for the prefix `heads/ma` returned `refs/heads/main`, while the
+exact-ref call for `heads/ma` answered not found. Ask for the exact ref (not found means absent), and run
+the same call on a branch that must exist, such as the default branch, so that a not-found answer from a
+broken call cannot pass for a clean delete.
 
 ### What a review pass should show
 
@@ -204,6 +288,19 @@ So the first step of a re-pin is still to read the body against the file at the 
 commit message that calls a change "a pure SHA bump" is a claim about the body, and it is tested by that
 read.
 
+### `pin-audit` cannot tell an old pin from a new one
+
+A row's verdict depends on the body and on the text at the pin, never on how far the pin lags the default
+branch. A pointer whose file has changed since the pin therefore reads the same at the old pin and at the
+new one. Checked with a README edited below its opening paragraph and given a bumped version stamp, so
+that the blob at the pin and the blob on the default branch differed: a generated body read `ok` with an
+empty detail at both pins, an untagged hand-written body read `ok` (`hand-written body; status-checked
+only`) at both, and a tagged body with a backticked term read `enriched` at both.
+
+So a clean row does not say the pin is current. The git comparison in section 2 does, and nothing else
+finds a stale blob pin. Use `pin-audit` as the check on the body and the comparison as the check on the
+pin, and run both, because each is blind to what the other sees.
+
 ### `ok` has two meanings
 
 `ok` has two code paths, told apart by the `detail` field and not by the verdict. An **empty** detail is the
@@ -235,6 +332,24 @@ the row moves to `enriched`. Three cautions:
   output, so regeneration equality already checks every word. Hand markup breaks that equality for good and
   leaves only the weaker term check, which covers just the marked terms.
 
+**Test the candidate body rather than reading the backticks by eye.** Call `audit_pin_row(meta, body,
+source_text)` with the tag the nugget will carry and the source text at the pin, and read the verdict: the
+row you want is `enriched`. Underneath it is `_body_claims_are_in_source(body, source_text)`, which returns
+True or False for the term check alone. It is a private helper whose name may change, so prefer the public
+function. A failure here is invisible in the marked-up text and obvious in the result.
+
+**Adding the `prescan` tag to a nugget that has none moves its row from `ok` to `diverged`.** An untagged
+body reads `ok` only because every check beyond the status line is skipped for it. Tag it and the
+regeneration comparison runs for the first time, and a body that a person wrote or improved never
+reproduces from the generator. Checked with one plain-prose body in three states: untagged, `ok`
+(`hand-written body; status-checked only`); the same body with the tag added and nothing else,
+`diverged`; the body marked up with backticked or bolded terms that all occur in the source, plus the
+tag, `enriched`. A body that already carries markup
+goes straight to `enriched` when tagged, provided every term is in the source, and stays `diverged` if one
+is not. So tagging alone is not progress, and the `ok` it replaces was never a stronger check, because
+nothing had compared that body with its source. Tag a nugget only when you mean to bring its body under
+the term check, and have the markup ready.
+
 A `diverged` row is a prompt to find the cause, not a category. Two rows with one verdict can need opposite
 treatment: one a plain-prose body that wants markup, another a real defect that markup would only launder.
 
@@ -245,6 +360,25 @@ so it can be run against source text you read from a local clone, with no token 
 command, rather than reimplementing the regeneration comparison. A reconstruction that feeds the generator
 the wrong input reports "body rewrite owed" on a body that is the generator's own output, and acting on that
 would replace a strong check with a weaker one for good.
+
+Reading the body against the source yourself is a second instrument, not a worse copy of the first. When
+the two disagree, that is information: resolve it by reading the source of the authoritative one (the
+function, here), and do not settle it by picking the answer you expected.
+
+### A truncation check is not a falsehood check
+
+`kb.py` guards against a generated abstract that was cut off mid-sentence with `_looks_truncated`, and it
+is easy to take for more than it is. It looks at the end of one string: a missing closing full stop,
+exclamation mark or question mark, or a last word that is a dangling function word such as "the" or
+"and". Its own docstring calls it partial and a backstop. Checked on scratch strings: a complete sentence
+that states something false returned False, and so did one that ends on a content word, while a fragment
+with no terminator and a fragment with a full stop appended after "the" returned True.
+
+It has one call site, inside the generator's abstract builder, so it guards what the generator would
+write and is never applied to a stored body. A stored body cut off mid-sentence, tagged `prescan` and
+carrying backticked terms that are in the source, read `enriched`. So a false body passes the guard
+because it is complete, and a cut-off stored body is not something `pin-audit` looks for. Only a read of
+the body against the source answers either question.
 
 ### `unfetchable` is one verdict for many failures
 
@@ -259,6 +393,24 @@ Read the **size** of the result before the content:
 - Nearly every row `unfetchable` is a fact about the credential, not about the corpus.
 - A handful `unfetchable` among many `ok` rows means a token was present and working. Re-run with a
   confirmed token before concluding anything, since a transient failure looks identical to a dead pin.
+
+The text of the verdict varies, which is easy to mistake for several failures. Each row carries a detail:
+`pinned blob could not be read` for a file pin, and `directory listing could not be read at the pin or on
+the default branch` for a directory pin. The plain-text report groups the rows under one heading,
+`pinned blob unreadable; nothing claimed`, which is the same for both kinds of pin and is not a summary of
+the corpus: the closing line counts these rows together with the external pointers as "could not be
+checked here". `--json` carries the row details and the counts and has no heading. All of these mean
+`unfetchable`, and none says why.
+
+To tell a dead pin from a failed read, ask git whether the pin is a real object. In a full clone of the
+source repository, `git cat-file -t <sha>` prints `commit` for a real commit and fails for one that does
+not exist, and `git show <sha>:<path>` reads the file at the pin. `git merge-base --is-ancestor <sha>
+origin/<default-branch>` then says whether the pin is on the default branch's history: a real commit that
+is not (one from a side branch, say, or one dropped by a history rewrite) passes the first two and fails
+the third. A shallow clone can fail `cat-file` for a real pin, so fetch the full history first. (Checked on
+scratch with a real pin, a pin that does not exist, a side-branch commit and a depth-1 clone.) If the
+object exists and `show` reads the file, the pin is sound and the row was a failed read, so re-run with a
+confirmed token.
 
 The list of rows that could not be read and the list of rows that are stale are different questions, and
 neither stands in for the other. Both directions have been seen: a read failure flagging a pointer that was
@@ -290,6 +442,21 @@ and the run still opens with `sync: drift detected across N managed repos.` So a
 is unreachable (for example because no credential was exported) reads as drift everywhere. Read the per-repository
 lines and not the headline. That is how it behaves at the commit checked, it is tracked as an open issue on
 this repository, and this file makes no claim about what `sync` returns to the shell.
+
+### `sync` after a commit that changed no nugget
+
+`sync` compares each managed repository's current head commit with the head recorded in the aggregate
+file, as well as comparing nugget bodies. Any commit to a managed repository moves the head, a
+documentation-only one included, so `sync` then reports `repo changed: recorded <sha> -> live <sha>` and
+nothing else: no `added`, `removed` or `changed` line for any nugget. Checked after a README-only commit to
+a scratch data repository. That line is the head moving, not a problem with a nugget, and it is not a
+reason to publish.
+
+`kb.py index --manifest` without `--publish` records the new head, after which `sync` reads clean. In the
+same check each slice it wrote held the same entries as that repository's `registry.json` on the remote,
+so there was nothing to publish. A publish records the head of its own commit in the baseline for the same
+reason, which is why `sync` reads clean straight after one. The same line appears when a peer's publish, or
+a killed run of your own, moved a head after the baseline was written.
 
 ## 5. `verified` through a re-pin
 
@@ -337,7 +504,9 @@ indistinguishable from the defect.
   that gives the arc and defers to the source needs no re-earning. One that enumerates does.
 - **"Behind" is not "wrong".** A generated body is the source's opening paragraph, so a change far below it
   cannot make the body false, and re-pinning it is tidying a lagging pointer. A body that under-describes its
-  file is a different matter from one that contradicts it; only the second is a defect.
+  file is a different matter from one that contradicts it. The second misleads a reader, which is the
+  more serious fault. The first is not a falsehood, and whether it is worth a rewrite is a judgement about
+  what a reader needs from the pointer, not a defect to clear.
 - **A nearby change is not evidence that a particular claim changed.** Read the sentence a nugget actually
   maps to at its current wording, not just the hunk that changed closest to it.
 - **A rewrite can invent.** A body edited "to catch up with recent events" can state a completion that never
