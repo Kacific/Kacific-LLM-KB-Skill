@@ -499,7 +499,7 @@ indistinguishable from the defect.
 ## 6. Writing a body that survives re-pins
 
 - **Describe what the file contains or points at, never what is still open in it.** A clause that states a
-  current condition ("the remaining jobs are still unwrapped") goes false the moment the source retires it,
+  current condition ("the migration is still in progress") goes false the moment the source retires it,
   and a body that quotes a version, a date or a count goes stale on every source change. A thematic abstract
   that gives the arc and defers to the source needs no re-earning. One that enumerates does.
 - **"Behind" is not "wrong".** A generated body is the source's opening paragraph, so a change far below it
