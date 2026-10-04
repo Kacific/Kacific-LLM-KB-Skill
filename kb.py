@@ -947,7 +947,13 @@ def cmd_index(args) -> int:
         config = load_config(args.config)
         manifest = load_manifest(config)
         ttl = args.max_age if args.max_age is not None else int(config.get("cache", {}).get("fetch_ttl_seconds", 0))
-        agg = build_aggregate(manifest, ttl_seconds=ttl, force=args.force)
+        # A publish must start from the remote's head, so it ignores the fetch TTL. Reusing a clone inside the
+        # window skips the hard reset that discards a commit a refused push left behind; the retry then compares
+        # its entries with the registry file that stranded commit wrote, reports `unchanged`, and pushes nothing
+        # while the remote still lacks them. It would also build the slices from a repo state that can lack a
+        # merge or a peer's publish. The review pass (no --publish) keeps the TTL, and so does `sync`.
+        publishing = bool(getattr(args, "publish", False))
+        agg = build_aggregate(manifest, ttl_seconds=ttl, force=args.force or publishing)
 
         # Derive each repo's audience slice from the aggregate and write it to the control home for review,
         # always (even without --publish), so the slices can be eyeballed before they reach any data repo.
@@ -3464,11 +3470,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="output path; default stdout (single repo) or <manifest dir>/registry-aggregate.json")
     sp.add_argument("--max-age", type=int, default=None, metavar="SECONDS",
                     help="reuse a managed repo's clone without re-fetching if its last fetch is within this "
-                         "window (default: config [cache].fetch_ttl_seconds, else 0 = always fetch)")
+                         "window (default: config [cache].fetch_ttl_seconds, else 0 = always fetch); "
+                         "ignored with --publish, which always fetches")
     sp.add_argument("--force", action="store_true", help="ignore the fetch cache and re-fetch every repo")
     sp.add_argument("--publish", action="store_true",
                     help="with --manifest, commit+push each changed audience slice into its data repo "
-                         "(a dev-Mac write step; needs write access, so the read-only cron never passes it)")
+                         "(a dev-Mac write step; needs write access, so the read-only cron never passes it); "
+                         "always fetches every repo fresh, whatever the fetch TTL says")
     sp.add_argument("--log-file",
                     help="single-repo index only: interaction log to stamp each entry's derived last_used "
                          "(omit to leave last_used null)")
