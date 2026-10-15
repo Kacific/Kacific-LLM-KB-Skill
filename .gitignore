@@ -18,3 +18,7 @@ logs/
 
 # Session worktrees (per the managed concurrency block in AGENTS.md)
 .claude/worktrees/
+
+# Legacy INI secret config (superseded by config.toml); never track a populated one
+config.ini
+config.ini.*
