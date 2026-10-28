@@ -342,6 +342,13 @@ the row moves to `enriched`. Three cautions:
   between them. Checked directly: ``one `/16` per site, a `/25` per rack`` yields the single term
   `' per site, a '`, which is not in the source, so the row stays `diverged` for a reason invisible in the
   marked-up text.
+- **Short markup counts for nothing on the bold side too, and the row says nothing about it.** A bolded label
+  under six characters (`**E1**`, `**NC**`) is not extracted, so a body whose only markup is short labels
+  still has no terms and stays `diverged`, with nothing in its text to say why. Checked directly:
+  ``Evidence tiers **E1**, **E2**, **D** and **NC** mark each fact`` yields no terms and the term check returns
+  False, while the same sentence with ``**Evidence tiers**`` (fourteen characters) or one backticked identifier
+  of four or more characters returns True. Before relying on markup, count the spans that fall inside both
+  ranges, and prefer an identifier the source already uses (a hostname or a file name) to a label.
 - **Do not mark up a row that already reads `ok` with an empty detail.** Its body is the generator's own
   output, so regeneration equality already checks every word. Hand markup breaks that equality for good and
   leaves only the weaker term check, which covers just the marked terms.
