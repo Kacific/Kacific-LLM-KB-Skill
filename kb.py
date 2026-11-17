@@ -1327,17 +1327,36 @@ def cmd_sync(args) -> int:
     Refreshes each managed clone, then diffs the live HEAD sha and per-nugget body hash against the recorded
     registry-aggregate.json: repos whose HEAD moved, nuggets added / removed / changed, out-of-band edits
     that fail the provenance gate, clones in the cache not in the manifest, and repos dropped from the
-    manifest. Report-only (raising these as tracking tasks is the separate feedback step); exit 0.
+    manifest. Report-only (raising these as tracking tasks is the separate feedback step).
+
+    Exit status, so a cron or CI job can tell the three outcomes apart:
+      0  clean: every managed repo was read and nothing drifted.
+      1  drift found: every managed repo was read and something differs from the recorded baseline.
+      2  could not look: a managed repo was unreachable, there is no readable baseline, or the config or
+         manifest could not be loaded. This is neither clean nor proof of drift; any drift seen in the repos
+         that could be read is still printed.
     """
-    manifest = load_manifest(load_config(args.config))
+    try:
+        manifest = load_manifest(load_config(args.config))
+    except SystemExit as e:
+        # load_config and load_manifest refuse with SystemExit(<message>), which the interpreter turns into
+        # exit status 1, the same status as drift found. Report it as could-not-look instead.
+        if isinstance(e.code, str):
+            print(f"sync: could not look: {e.code}", file=sys.stderr)
+            return 2
+        raise
     agg_path = (
         Path(args.aggregate).expanduser() if args.aggregate
         else manifest["manifest_path"].parent / "registry-aggregate.json"
     )
     if not agg_path.exists():
-        print(f"sync: no recorded baseline at {agg_path}. Run `kb.py index --manifest` first.")
-        return 0
-    recorded = json.loads(agg_path.read_text(encoding="utf-8"))
+        print(f"sync: could not look: no recorded baseline at {agg_path}. Run `kb.py index --manifest` first.")
+        return 2
+    try:
+        recorded = json.loads(agg_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        print(f"sync: could not look: the recorded baseline at {agg_path} is unreadable ({e}).")
+        return 2
     rec_repos = recorded.get("repos", {})
     rec_hash = {(e.get("source_repo"), e["id"]): e.get("content_hash") for e in recorded.get("entries", [])}
 
@@ -1345,6 +1364,7 @@ def cmd_sync(args) -> int:
     cache_root = manifest["cache_root"]
     managed_keys = set(manifest["managed"])
     report: list[tuple[str, list[str]]] = []
+    unreachable: list[str] = []
 
     for key, spec in sorted(manifest["managed"].items()):
         lines: list[str] = []
@@ -1352,6 +1372,7 @@ def cmd_sync(args) -> int:
         # `index` shortly after this sync can reuse the fetch.
         head, status = _refresh_clone(spec.get("url"), cache_dir / key, cache_root=cache_root, force=True)
         if status != "ok":
+            unreachable.append(key)
             report.append((key, [f"UNREACHABLE: {status}"]))
             continue
         rec_head = (rec_repos.get(key) or {}).get("head_sha")
@@ -1382,11 +1403,19 @@ def cmd_sync(args) -> int:
                 unmanaged.append(child.name)
     dropped = sorted(set(rec_repos) - managed_keys)
 
-    if not any(lines for _, lines in report) and not unmanaged and not dropped:
+    drifted = (
+        any(not line.startswith("UNREACHABLE") for _, lines in report for line in lines)
+        or bool(unmanaged) or bool(dropped)
+    )
+    if not unreachable and not drifted:
         print(f"sync: clean. {len(report)} managed repos, no drift.")
         return 0
 
-    print(f"sync: drift detected across {len(report)} managed repos.\n")
+    if unreachable:
+        print(f"sync: could not look at {len(unreachable)} of {len(report)} managed repos "
+              f"({', '.join(unreachable)}). This is not a clean result and not proof of drift.\n")
+    if drifted:
+        print(f"sync: drift detected across {len(report)} managed repos.\n")
     for key, lines in report:
         if lines:
             print(f"repo: {key}")
@@ -1403,7 +1432,8 @@ def cmd_sync(args) -> int:
         for name in dropped:
             print(f"  - {name}")
         print()
-    return 0
+    # Could-not-look outranks drift: an incomplete look can claim neither clean nor the whole drift picture.
+    return 2 if unreachable else 1
 
 
 def cmd_cache(args) -> int:

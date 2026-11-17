@@ -33,7 +33,9 @@ kb.py feedback         append a usage/rating/miss record, or report gap/ROT/conf
                        reconciles them into the tracking project's KB Findings section)
 kb.py coordination-audit  close opt-in coordination tasks whose tracked KB findings have all cleared
                        (--commit closes them; default is a read-only dry-run)
-kb.py sync             drift-detect the managed repos against the recorded aggregate
+kb.py sync             drift-detect the managed repos against the recorded aggregate; exit 0 clean,
+                       1 drift found, 2 could not look (a repo unreachable, no readable baseline, or the
+                       config would not load), so a scheduler can tell the three apart
 kb.py prescan          scan the manifest's seed sources into ranked pointer candidates (--commit stages
                        them for review; keepers land via the normal store gate, into a linked worktree)
 kb.py export           (Phase 1b)
