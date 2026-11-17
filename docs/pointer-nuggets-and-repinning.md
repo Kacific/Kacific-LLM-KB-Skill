@@ -458,11 +458,17 @@ is fixed, so a stable count is no evidence that a particular nugget is clean; ch
 
 ### `sync` and a repository it cannot reach
 
-When `kb.py sync` cannot fetch a managed repository it lists `UNREACHABLE: <reason>` under that repository,
-and the run still opens with `sync: drift detected across N managed repos.` So a run in which every repository
-is unreachable (for example because no credential was exported) reads as drift everywhere. Read the per-repository
-lines and not the headline. That is how it behaves at the commit checked, it is tracked as an open issue on
-this repository, and this file makes no claim about what `sync` returns to the shell.
+When `kb.py sync` cannot fetch a managed repository it lists `UNREACHABLE: <reason>` under that repository and opens the
+run with `sync: could not look at N of M managed repos (...). This is not a clean result and not proof of drift.` It then
+exits 2. Drift seen in the repositories that could be read is still printed, under its own `sync: drift detected` line, and
+a run with both exits 2, because an incomplete look can claim neither clean nor the whole drift picture.
+
+The exit status of `sync` is: 0 clean (every repository read, nothing differs), 1 drift found (every repository read,
+something differs), 2 could not look (a repository unreachable, no readable recorded baseline, or the config or manifest
+would not load). Before this was fixed every outcome exited 0, and an unreachable repository was printed as drift, so a
+run with no credential exported read as drift everywhere and a scheduler could not tell any of the cases apart. A job
+that runs `sync` on a schedule should treat 0 and 1 as the tool having worked, because drift is routine between an
+`index --manifest` run and the next, and treat 2 as the failure: the check did not happen.
 
 ### `sync` after a commit that changed no nugget
 

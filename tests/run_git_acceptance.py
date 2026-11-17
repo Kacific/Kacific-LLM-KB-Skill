@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -249,7 +250,7 @@ def sync_clean_then_detects_change_add_remove():
         out = drift.stdout
         ok = (
             clean.returncode == 0 and "clean" in clean.stdout
-            and drift.returncode == 0 and "clean" not in out
+            and drift.returncode == 1 and "clean" not in out
             and "repo: allstaff" in out
             and "repo changed:" in out
             and "changed: shared-wifi" in out
@@ -283,7 +284,7 @@ def sync_flags_out_of_band_invalid_and_unmanaged():
         p = kb("sync", "--config", str(cfg))
         out = p.stdout
         ok = (
-            p.returncode == 0
+            p.returncode == 1
             and "out-of-band invalid nugget 'shared-bad'" in out
             and "unmanaged" in out and "rogue" in out
         )
@@ -360,10 +361,108 @@ def sync_always_fetches_ignoring_ttl():
         p = kb("sync", "--config", str(cfg))
         out = p.stdout
         ok = (
-            p.returncode == 0 and "clean" not in out
+            p.returncode == 1 and "clean" not in out
             and "repo: allstaff" in out and "added: shared-new" in out
         )
         return ok, f"stdout={out.strip()[:160]!r}"
+
+
+@check
+def sync_unreachable_repo_is_could_not_look_exit_2():
+    # A repo that cannot be fetched is neither clean nor drift: sync must say so and exit 2, and must not
+    # present the unreadable repo as drift (the old behaviour printed it as drift and exited 0).
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        admin = root / "admin"; admin.mkdir()
+        cache = root / "cache"
+        url_a = make_remote(root, "allstaff", {
+            "shared/ok.md": nugget("shared-ok", "shared", "OK", "A properly grounded and sourced fact."),
+        })
+        url_t = make_remote(root, "technical", {
+            "technical/vpn.md": nugget("tech-vpn", "technical", "VPN", "Use the corporate VPN profile from the pack."),
+        })
+        cfg = write_manifest(admin, cache, {"allstaff": (url_a, "AllStaff"), "technical": (url_t, "Technical")})
+        if kb("index", "--manifest", "--config", str(cfg)).returncode != 0:
+            return False, "baseline index failed"
+        shutil.rmtree(root / "technical.git")   # the remote disappears: fetch fails
+        p = kb("sync", "--config", str(cfg))
+        out = p.stdout
+        ok = (
+            p.returncode == 2
+            and "could not look at 1 of 2 managed repos (technical)" in out
+            and "UNREACHABLE" in out
+            and "sync: clean" not in out and "drift detected" not in out
+        )
+        return ok, f"rc={p.returncode} stdout={out.strip()[:200]!r}"
+
+
+@check
+def sync_unreachable_plus_drift_is_exit_2_and_still_prints_the_drift():
+    # Could-not-look outranks drift (an incomplete look cannot claim the whole picture), but the drift seen in
+    # the repos that could be read must still be printed.
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        admin = root / "admin"; admin.mkdir()
+        cache = root / "cache"
+        url_a = make_remote(root, "allstaff", {
+            "shared/ok.md": nugget("shared-ok", "shared", "OK", "A properly grounded and sourced fact."),
+        })
+        url_t = make_remote(root, "technical", {
+            "technical/vpn.md": nugget("tech-vpn", "technical", "VPN", "Use the corporate VPN profile from the pack."),
+        })
+        cfg = write_manifest(admin, cache, {"allstaff": (url_a, "AllStaff"), "technical": (url_t, "Technical")})
+        if kb("index", "--manifest", "--config", str(cfg)).returncode != 0:
+            return False, "baseline index failed"
+        commit_to_remote(root, "allstaff", writes={
+            "shared/new.md": nugget("shared-new", "shared", "New", "A change that is visible while another repo is not."),
+        })
+        shutil.rmtree(root / "technical.git")
+        p = kb("sync", "--config", str(cfg))
+        out = p.stdout
+        ok = (
+            p.returncode == 2
+            and "could not look at 1 of 2 managed repos (technical)" in out
+            and "drift detected" in out and "added: shared-new" in out
+            and "UNREACHABLE" in out
+        )
+        return ok, f"rc={p.returncode} stdout={out.strip()[:240]!r}"
+
+
+@check
+def sync_without_a_baseline_is_could_not_look_exit_2():
+    # No recorded aggregate means there is nothing to compare against: could not look, not clean.
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        admin = root / "admin"; admin.mkdir()
+        cache = root / "cache"
+        url_a = make_remote(root, "allstaff", {
+            "shared/ok.md": nugget("shared-ok", "shared", "OK", "A properly grounded and sourced fact."),
+        })
+        cfg = write_manifest(admin, cache, {"allstaff": (url_a, "AllStaff")})
+        p = kb("sync", "--config", str(cfg))   # `index --manifest` was never run
+        ok = p.returncode == 2 and "could not look: no recorded baseline" in p.stdout and "sync: clean" not in p.stdout
+        return ok, f"rc={p.returncode} stdout={p.stdout.strip()[:160]!r}"
+
+
+@check
+def sync_with_an_unreadable_baseline_is_could_not_look_exit_2():
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        admin = root / "admin"; admin.mkdir()
+        cache = root / "cache"
+        url_a = make_remote(root, "allstaff", {
+            "shared/ok.md": nugget("shared-ok", "shared", "OK", "A properly grounded and sourced fact."),
+        })
+        cfg = write_manifest(admin, cache, {"allstaff": (url_a, "AllStaff")})
+        if kb("index", "--manifest", "--config", str(cfg)).returncode != 0:
+            return False, "baseline index failed"
+        baseline = admin / "registry-aggregate.json"
+        if not baseline.exists():
+            return False, f"expected the baseline at {baseline}"
+        baseline.write_text("{not json", encoding="utf-8")
+        p = kb("sync", "--config", str(cfg))
+        ok = p.returncode == 2 and "could not look" in p.stdout and "unreadable" in p.stdout
+        return ok, f"rc={p.returncode} stdout={p.stdout.strip()[:160]!r}"
 
 
 @check

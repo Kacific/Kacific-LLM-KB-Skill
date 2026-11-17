@@ -633,7 +633,7 @@ def sync_requires_manifest():
     # deploying, not by running the suite locally, where it can never fail.
     with tempfile.TemporaryDirectory() as d:
         p = run("sync", cwd=d)
-    ok = p.returncode != 0 and "manifest" in p.stderr.lower()
+    ok = p.returncode == 2 and "manifest" in p.stderr.lower()   # could not look, not drift (1)
     return ok, f"rc={p.returncode} stderr={p.stderr.strip()!r}"
 
 
