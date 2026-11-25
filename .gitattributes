@@ -1,0 +1,22 @@
+# Kacific standard .gitattributes: the same file in every repo.
+# LF in the repository and in every working copy, on Windows, WSL and macOS alike.
+# The only exceptions are Windows batch scripts, which need CRLF to run.
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.xlsx binary
+*.docx binary
+*.pptx binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
