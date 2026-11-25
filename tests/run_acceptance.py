@@ -2185,6 +2185,30 @@ def guard_r2_reports_a_could_not_look_when_the_helper_is_missing():
         return ok, f"rc={p.returncode} said_could_not_look={'could-not-look' in p.stderr}"
 
 
+@check
+def registry_entry_path_is_posix_for_a_windows_style_path():
+    """A registry `path` is published and read on every OS, so it must always use forward slashes. On Windows
+    `str()` of a relative path uses backslashes, which rewrote every entry of every audience slice (found
+    2026-11-25 when a Windows workstation reviewed a publish: every entry differed in `path` alone)."""
+    from pathlib import PureWindowsPath
+    n = _nugget_dict()
+    n["path"] = PureWindowsPath("technical") / "x-note.md"
+    entry = kb._registry_entry(n, None)
+    return entry["path"] == "technical/x-note.md", f"path={entry['path']!r}"
+
+
+@check
+def rot_flag_path_is_posix_for_a_windows_style_path():
+    """The same rule for the path a rot finding carries (it is filed into Asana and read on other hosts)."""
+    from pathlib import PureWindowsPath
+    n = _nugget_dict(status="archived")
+    n["path"] = PureWindowsPath("technical") / "x-note.md"
+    res = kb._rot_flags([n], _NOW)
+    flags = res[0] if isinstance(res, tuple) else res
+    paths = [f.get("path") for f in flags]
+    return bool(paths) and all(x == "technical/x-note.md" for x in paths), f"paths={paths!r}"
+
+
 def main() -> int:
     failures = 0
     for fn in CHECKS:
