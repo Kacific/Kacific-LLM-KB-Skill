@@ -426,6 +426,13 @@ def _load_nuggets(root: Path) -> list[dict]:
     return nuggets
 
 
+def _posix_path(p) -> str:
+    """A nugget's relative path as it is PUBLISHED: forward slashes, whatever OS built it. `str()` of a Windows
+    path uses backslashes, which rewrote the `path` of every registry entry when a slice was built on Windows
+    (found 2026-11-25, caught in a review pass before any publish). Registries are read on every host."""
+    return p.as_posix() if hasattr(p, "as_posix") else str(p).replace("\\", "/")
+
+
 def _registry_entry(n: dict, last_used_map: dict | None = None) -> dict:
     m = n["meta"]
     last_used = (last_used_map or {}).get(m["id"])
@@ -444,7 +451,7 @@ def _registry_entry(n: dict, last_used_map: dict | None = None) -> dict:
         # usage is seen. Carries the "in active use" signal to the rot sweep across hosts via the registry;
         # never a substitute for `last_verified`, which stays a human-only field.
         "last_used": last_used.strftime("%Y-%m-%dT%H:%M:%SZ") if last_used else None,
-        "path": str(n["path"]),
+        "path": _posix_path(n["path"]),
         "content_hash": body_hash(n["body"]),
     }
 
@@ -1283,7 +1290,7 @@ def _rot_flags(nuggets: list[dict], now: datetime, last_used_map: dict | None = 
             reasons.append("Trivial (near-empty body; owner confirms)")
         if reasons:
             flags.append({
-                "id": m["id"], "path": str(n["path"]),
+                "id": m["id"], "path": _posix_path(n["path"]),
                 "owner": m.get("owner_name") or m.get("owner_gid") or "(unassigned)",
                 # owner_gid is carried separately (additive) so `feedback` can assign the Asana task to a real
                 # person; `owner` stays the display string so `cmd_rot` grouping and its tests are unchanged.
